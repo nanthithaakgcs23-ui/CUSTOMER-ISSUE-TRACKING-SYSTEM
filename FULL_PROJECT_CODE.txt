@@ -1,0 +1,3067 @@
+
+===== FILE: app.py =====
+
+from functools import wraps
+from pathlib import Path
+import csv
+import io
+import json
+import time
+
+from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory, Response, jsonify
+from flask_mysqldb import MySQL
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+
+# Flask app setup
+app = Flask(__name__)
+app.secret_key = "replace_with_a_secure_secret_key"
+
+# MySQL configuration (update these values for your local setup)
+app.config["MYSQL_HOST"] = "localhost"
+app.config["MYSQL_USER"] = "root"
+app.config["MYSQL_PASSWORD"] = "Nandhu@0105"
+app.config["MYSQL_DB"] = "customer_issue_tracking"
+app.config["MYSQL_CURSORCLASS"] = "DictCursor"
+
+# Upload configuration
+UPLOAD_FOLDER = Path("uploads")
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "pdf", "doc", "docx", "txt"}
+MAX_FILES_PER_ISSUE = 5
+MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024
+app.config["UPLOAD_FOLDER"] = str(UPLOAD_FOLDER)
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+
+# Ensure uploads folder exists
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+
+mysql = MySQL(app)
+serializer = URLSafeTimedSerializer(app.secret_key)
+
+
+def init_optional_tables():
+    """Create optional extension tables if they do not exist."""
+    cur = mysql.connection.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS issue_ratings (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            issue_id INT NOT NULL UNIQUE,
+            user_id INT NOT NULL,
+            rating TINYINT NOT NULL,
+            feedback TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_issue_ratings_issue FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+            CONSTRAINT fk_issue_ratings_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    mysql.connection.commit()
+    cur.close()
+
+
+def allowed_file(filename: str) -> bool:
+    """Return True if file extension is allowed."""
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def get_file_size(file) -> int:
+    """Safely calculate file size without consuming file content."""
+    current_position = file.stream.tell()
+    file.stream.seek(0, 2)
+    size = file.stream.tell()
+    file.stream.seek(current_position)
+    return size
+
+
+def parse_attachments(file_path_value):
+    """Convert DB file_path field into a list of attachment names."""
+    if not file_path_value:
+        return []
+
+    if isinstance(file_path_value, str):
+        value = file_path_value.strip()
+        if value.startswith("["):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                return [value]
+        if "|" in value:
+            return [item for item in value.split("|") if item]
+        return [value]
+
+    return []
+
+
+def attach_files_to_issues(issues):
+    """Inject attachments list into issue dict objects for template rendering."""
+    for issue in issues:
+        issue["attachments"] = parse_attachments(issue.get("file_path"))
+
+
+def login_required(role=None):
+    """Protect routes and optionally enforce a specific role."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if "user_id" not in session:
+                flash("Please log in first.", "warning")
+                return redirect(url_for("customer_login"))
+
+            if role and session.get("role") != role:
+                flash("You are not authorized to access this page.", "danger")
+                return redirect(url_for("home"))
+
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def generate_reset_token(user_id: int, email: str) -> str:
+    """Generate a time-limited reset token for password reset."""
+    return serializer.dumps({"user_id": user_id, "email": email}, salt="password-reset")
+
+
+def verify_reset_token(token: str, max_age_seconds: int = 1800):
+    """Validate reset token and return payload or None."""
+    try:
+        data = serializer.loads(token, salt="password-reset", max_age=max_age_seconds)
+        return data
+    except (BadSignature, SignatureExpired):
+        return None
+
+
+@app.route("/")
+def home():
+    """Public landing page and role-based redirect."""
+    if session.get("role") == "customer":
+        return redirect(url_for("customer_dashboard"))
+    if session.get("role") == "admin":
+        return redirect(url_for("admin_dashboard"))
+    return redirect(url_for("customer_login"))
+
+
+@app.before_request
+def ensure_optional_tables():
+    """Ensure extension tables are available."""
+    if not app.config.get("_OPTIONAL_TABLES_READY"):
+        init_optional_tables()
+        app.config["_OPTIONAL_TABLES_READY"] = True
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    """Customer registration route."""
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        if not name or not email or not password:
+            flash("All fields are required.", "danger")
+            return render_template("register.html")
+
+        if password != confirm_password:
+            flash("Passwords do not match.", "danger")
+            return render_template("register.html")
+
+        cur = mysql.connection.cursor()
+        cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+        existing_user = cur.fetchone()
+
+        if existing_user:
+            flash("Email is already registered.", "warning")
+            cur.close()
+            return render_template("register.html")
+
+        hashed_password = generate_password_hash(password)
+        cur.execute(
+            "INSERT INTO users (name, email, password, role) VALUES (%s, %s, %s, %s)",
+            (name, email, hashed_password, "customer"),
+        )
+        mysql.connection.commit()
+        cur.close()
+
+        flash("Registration successful. Please log in.", "success")
+        return redirect(url_for("customer_login"))
+
+    return render_template("register.html")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def customer_login():
+    """Customer login route."""
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+
+        cur = mysql.connection.cursor()
+        cur.execute("SELECT * FROM users WHERE email = %s AND role = %s", (email, "customer"))
+        user = cur.fetchone()
+        cur.close()
+
+        if user and check_password_hash(user["password"], password):
+            session["user_id"] = user["id"]
+            session["name"] = user["name"]
+            session["role"] = user["role"]
+            flash("Welcome back!", "success")
+            return redirect(url_for("customer_dashboard"))
+
+        flash("Invalid customer credentials.", "danger")
+
+    return render_template("login.html")
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    """Generate password reset link for a registered user email."""
+    reset_link = None
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+
+        if not email:
+            flash("Please enter your registered email.", "danger")
+            return render_template("forgot_password.html")
+
+        cur = mysql.connection.cursor()
+        cur.execute("SELECT id, email FROM users WHERE email = %s", (email,))
+        user = cur.fetchone()
+        cur.close()
+
+        # Always show generic success message to avoid account enumeration.
+        if user:
+            token = generate_reset_token(user["id"], user["email"])
+            reset_link = url_for("reset_password", token=token, _external=True)
+            flash("Password reset link generated successfully.", "info")
+            # Optional server-side visibility for development mode.
+            print(f"[Password Reset Link] {reset_link}")
+        else:
+            flash("If the email is registered, a reset link has been generated.", "info")
+
+        return render_template("forgot_password.html", reset_link=reset_link)
+
+    return render_template("forgot_password.html", reset_link=reset_link)
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    """Reset user password using a signed token link."""
+    data = verify_reset_token(token)
+    if not data:
+        flash("Reset link is invalid or expired. Please request a new one.", "danger")
+        return redirect(url_for("forgot_password"))
+
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        if not password or len(password) < 6:
+            flash("Password must be at least 6 characters.", "danger")
+            return render_template("reset_password.html", token=token)
+
+        if password != confirm_password:
+            flash("Passwords do not match.", "danger")
+            return render_template("reset_password.html", token=token)
+
+        cur = mysql.connection.cursor()
+        cur.execute(
+            "UPDATE users SET password = %s WHERE id = %s",
+            (generate_password_hash(password), data["user_id"]),
+        )
+        mysql.connection.commit()
+        cur.close()
+
+        flash("Password reset successful. Please log in.", "success")
+        return redirect(url_for("customer_login"))
+
+    return render_template("reset_password.html", token=token)
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    """Admin login route."""
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+
+        cur = mysql.connection.cursor()
+        cur.execute("SELECT * FROM users WHERE email = %s AND role = %s", (email, "admin"))
+        admin = cur.fetchone()
+        cur.close()
+
+        if admin:
+            password_ok = False
+
+            # Normal path: hashed password validation.
+            if admin["password"].startswith(("pbkdf2:", "scrypt:")):
+                password_ok = check_password_hash(admin["password"], password)
+            else:
+                # Compatibility path for first-time seeded admin password.
+                password_ok = admin["password"] == password
+                if password_ok:
+                    cur = mysql.connection.cursor()
+                    cur.execute(
+                        "UPDATE users SET password = %s WHERE id = %s",
+                        (generate_password_hash(password), admin["id"]),
+                    )
+                    mysql.connection.commit()
+                    cur.close()
+
+            if password_ok:
+                session["user_id"] = admin["id"]
+                session["name"] = admin["name"]
+                session["role"] = admin["role"]
+                flash("Admin login successful.", "success")
+                return redirect(url_for("admin_dashboard"))
+
+        flash("Invalid admin credentials.", "danger")
+
+    return render_template("admin_login.html")
+
+
+@app.route("/logout")
+def logout():
+    """Clear session for both customer and admin."""
+    session.clear()
+    flash("Logged out successfully.", "info")
+    return redirect(url_for("home"))
+
+
+@app.route("/customer/dashboard")
+@login_required(role="customer")
+def customer_dashboard():
+    """Show customer summary and recent issues."""
+    cur = mysql.connection.cursor()
+
+    cur.execute("SELECT COUNT(*) AS total FROM issues WHERE user_id = %s", (session["user_id"],))
+    total_issues = cur.fetchone()["total"]
+
+    cur.execute(
+        "SELECT COUNT(*) AS open_count FROM issues WHERE user_id = %s AND status IN ('Open', 'In Progress')",
+        (session["user_id"],),
+    )
+    active_issues = cur.fetchone()["open_count"]
+
+    cur.execute(
+        "SELECT * FROM issues WHERE user_id = %s ORDER BY created_at DESC LIMIT 5",
+        (session["user_id"],),
+    )
+    recent_issues = cur.fetchall()
+
+    cur.close()
+
+    return render_template(
+        "customer_dashboard.html",
+        total_issues=total_issues,
+        active_issues=active_issues,
+        recent_issues=recent_issues,
+    )
+
+
+@app.route("/issues/new", methods=["GET", "POST"])
+@login_required(role="customer")
+def create_issue():
+    """Create a new issue with optional multi-file upload."""
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        category = request.form.get("category", "").strip()
+        priority = request.form.get("priority", "").strip()
+        description = request.form.get("description", "").strip()
+        files = request.files.getlist("attachments")
+
+        if not title or not category or not priority or not description:
+            flash("Please fill in all required fields.", "danger")
+            return render_template("create_issue.html")
+
+        # Hard duplicate detection by exact normalized match.
+        normalized_title = " ".join(title.lower().split())
+        normalized_description = " ".join(description.lower().split())
+
+        cur = mysql.connection.cursor()
+        cur.execute(
+            """
+            SELECT id, title, status, created_at
+            FROM issues
+            WHERE user_id = %s
+              AND LOWER(TRIM(title)) = %s
+              AND LOWER(TRIM(description)) = %s
+              AND category = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (session["user_id"], normalized_title, normalized_description, category),
+        )
+        exact_duplicate = cur.fetchone()
+        cur.close()
+        if exact_duplicate:
+            flash("Duplicate blocked: the same issue already exists.", "danger")
+            return render_template("create_issue.html")
+
+        # Hard block for similar issues by title match (same customer).
+        cur = mysql.connection.cursor()
+        cur.execute(
+            """
+            SELECT id, title, status, created_at
+            FROM issues
+            WHERE user_id = %s
+              AND (
+                LOWER(title) LIKE %s
+                OR LOWER(description) LIKE %s
+              )
+            ORDER BY created_at DESC
+            LIMIT 3
+            """,
+            (session["user_id"], f"%{normalized_title}%", f"%{normalized_title}%"),
+        )
+        possible_duplicates = cur.fetchall()
+        cur.close()
+        if possible_duplicates:
+            flash("Similar issue found. Submission blocked to avoid duplicate tickets.", "danger")
+            return render_template("create_issue.html")
+
+        uploaded_files = []
+        selected_files = [f for f in files if f and f.filename]
+        if len(selected_files) > MAX_FILES_PER_ISSUE:
+            flash(f"You can upload up to {MAX_FILES_PER_ISSUE} files only.", "danger")
+            return render_template("create_issue.html")
+
+        for file in selected_files:
+            if not allowed_file(file.filename):
+                flash("One or more files have an invalid type.", "danger")
+                return render_template("create_issue.html")
+
+            if get_file_size(file) > MAX_FILE_SIZE_BYTES:
+                flash("Each file must be 5 MB or smaller.", "danger")
+                return render_template("create_issue.html")
+
+            safe_name = secure_filename(file.filename)
+            file_name = f"{int(time.time())}_{safe_name}"
+            file.save(UPLOAD_FOLDER / file_name)
+            uploaded_files.append(file_name)
+
+        cur = mysql.connection.cursor()
+        cur.execute(
+            """
+            INSERT INTO issues (user_id, title, category, priority, description, status, remark, file_path, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                session["user_id"],
+                title,
+                category,
+                priority,
+                description,
+                "Open",
+                "",
+                json.dumps(uploaded_files) if uploaded_files else None,
+            ),
+        )
+        mysql.connection.commit()
+        cur.close()
+
+        flash("Issue submitted successfully.", "success")
+        return redirect(url_for("customer_issues"))
+
+    return render_template("create_issue.html")
+
+
+@app.route("/customer/issues")
+@login_required(role="customer")
+def customer_issues():
+    """List all issues submitted by the logged-in customer."""
+    sort_by = request.args.get("sort_by", "created_at").strip()
+    sort_dir = request.args.get("sort_dir", "desc").strip().lower()
+    sort_dir_sql = "ASC" if sort_dir == "asc" else "DESC"
+    allowed_sort = {
+        "created_at": "created_at",
+        "priority": "FIELD(priority, 'Low', 'Medium', 'High', 'Critical')",
+        "status": "FIELD(status, 'Open', 'In Progress', 'Resolved')",
+        "title": "title",
+    }
+    sort_expr = allowed_sort.get(sort_by, "created_at")
+
+    cur = mysql.connection.cursor()
+    cur.execute(f"SELECT * FROM issues WHERE user_id = %s ORDER BY {sort_expr} {sort_dir_sql}", (session["user_id"],))
+    issues = cur.fetchall()
+    issue_ids = [issue["id"] for issue in issues]
+
+    ratings_by_issue = {}
+    if issue_ids:
+        placeholders = ", ".join(["%s"] * len(issue_ids))
+        cur.execute(
+            f"SELECT issue_id, rating, feedback FROM issue_ratings WHERE issue_id IN ({placeholders})",
+            tuple(issue_ids),
+        )
+        ratings = cur.fetchall()
+        ratings_by_issue = {row["issue_id"]: row for row in ratings}
+    cur.close()
+    attach_files_to_issues(issues)
+
+    for issue in issues:
+        issue["rating_data"] = ratings_by_issue.get(issue["id"])
+
+    return render_template("customer_issues.html", issues=issues, sort_by=sort_by, sort_dir=sort_dir)
+
+
+@app.route("/issues/<int:issue_id>/rate", methods=["POST"])
+@login_required(role="customer")
+def rate_issue(issue_id):
+    """Allow customer to rate resolved tickets once."""
+    rating = request.form.get("rating", "").strip()
+    feedback = request.form.get("feedback", "").strip()
+
+    try:
+        rating_value = int(rating)
+    except ValueError:
+        flash("Please select a valid rating.", "danger")
+        return redirect(url_for("customer_issues"))
+
+    if rating_value < 1 or rating_value > 5:
+        flash("Rating must be between 1 and 5.", "danger")
+        return redirect(url_for("customer_issues"))
+
+    cur = mysql.connection.cursor()
+    cur.execute(
+        "SELECT id, status FROM issues WHERE id = %s AND user_id = %s",
+        (issue_id, session["user_id"]),
+    )
+    issue = cur.fetchone()
+    if not issue:
+        cur.close()
+        flash("Issue not found.", "danger")
+        return redirect(url_for("customer_issues"))
+
+    if issue["status"] != "Resolved":
+        cur.close()
+        flash("You can rate only resolved issues.", "warning")
+        return redirect(url_for("customer_issues"))
+
+    cur.execute("SELECT id FROM issue_ratings WHERE issue_id = %s", (issue_id,))
+    existing = cur.fetchone()
+    if existing:
+        cur.close()
+        flash("Rating already submitted for this issue.", "info")
+        return redirect(url_for("customer_issues"))
+
+    cur.execute(
+        "INSERT INTO issue_ratings (issue_id, user_id, rating, feedback) VALUES (%s, %s, %s, %s)",
+        (issue_id, session["user_id"], rating_value, feedback),
+    )
+    mysql.connection.commit()
+    cur.close()
+
+    flash("Thank you for your feedback.", "success")
+    return redirect(url_for("customer_issues"))
+
+
+@app.route("/issues/<int:issue_id>/reopen", methods=["POST"])
+@login_required(role="customer")
+def reopen_issue(issue_id):
+    """Allow customer to reopen resolved issues with a reason."""
+    reason = request.form.get("reopen_reason", "").strip()
+    if not reason:
+        flash("Please provide a reason to reopen the issue.", "warning")
+        return redirect(url_for("customer_issues"))
+
+    cur = mysql.connection.cursor()
+    cur.execute(
+        "SELECT status, remark FROM issues WHERE id = %s AND user_id = %s",
+        (issue_id, session["user_id"]),
+    )
+    issue = cur.fetchone()
+
+    if not issue:
+        cur.close()
+        flash("Issue not found.", "danger")
+        return redirect(url_for("customer_issues"))
+
+    if issue["status"] != "Resolved":
+        cur.close()
+        flash("Only resolved issues can be reopened.", "warning")
+        return redirect(url_for("customer_issues"))
+
+    previous_remark = (issue.get("remark") or "").strip()
+    customer_note = f"Customer reopened issue: {reason}"
+    combined_remark = f"{previous_remark} | {customer_note}" if previous_remark else customer_note
+
+    cur.execute(
+        "UPDATE issues SET status = %s, remark = %s WHERE id = %s AND user_id = %s",
+        ("Open", combined_remark, issue_id, session["user_id"]),
+    )
+    mysql.connection.commit()
+    cur.close()
+
+    flash("Issue reopened successfully.", "success")
+    return redirect(url_for("customer_issues"))
+
+
+@app.route("/issues/<int:issue_id>/delete", methods=["POST"])
+@login_required(role="customer")
+def delete_customer_issue(issue_id):
+    """Allow customer to delete only their own issue."""
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT id FROM issues WHERE id = %s AND user_id = %s", (issue_id, session["user_id"]))
+    issue = cur.fetchone()
+    if not issue:
+        cur.close()
+        flash("Issue not found.", "danger")
+        return redirect(url_for("customer_issues"))
+
+    cur.execute("DELETE FROM issues WHERE id = %s AND user_id = %s", (issue_id, session["user_id"]))
+    mysql.connection.commit()
+    cur.close()
+    flash("Issue deleted successfully.", "success")
+    return redirect(url_for("customer_issues"))
+
+
+@app.route("/uploads/<path:filename>")
+@login_required()
+def uploaded_file(filename):
+    """Serve uploaded files to authenticated users."""
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+
+
+@app.route("/admin/dashboard")
+@login_required(role="admin")
+def admin_dashboard():
+    """Admin dashboard with stats and chart data."""
+    cur = mysql.connection.cursor()
+
+    cur.execute("SELECT COUNT(*) AS total FROM issues")
+    total_issues = cur.fetchone()["total"]
+
+    cur.execute("SELECT COUNT(*) AS open_count FROM issues WHERE status IN ('Open', 'In Progress')")
+    open_issues = cur.fetchone()["open_count"]
+
+    cur.execute("SELECT COUNT(*) AS resolved_count FROM issues WHERE status = 'Resolved'")
+    resolved_issues = cur.fetchone()["resolved_count"]
+
+    cur.close()
+
+    return render_template(
+        "admin_dashboard.html",
+        total_issues=total_issues,
+        open_issues=open_issues,
+        resolved_issues=resolved_issues,
+    )
+
+
+@app.route("/admin/issues")
+@login_required(role="admin")
+def admin_issues():
+    """Admin list page with filter by status and priority."""
+    status_filter = request.args.get("status", "").strip()
+    priority_filter = request.args.get("priority", "").strip()
+    sort_by = request.args.get("sort_by", "created_at").strip()
+    sort_dir = request.args.get("sort_dir", "desc").strip().lower()
+    sort_dir_sql = "ASC" if sort_dir == "asc" else "DESC"
+    allowed_sort = {
+        "created_at": "issues.created_at",
+        "priority": "FIELD(issues.priority, 'Low', 'Medium', 'High', 'Critical')",
+        "status": "FIELD(issues.status, 'Open', 'In Progress', 'Resolved')",
+        "title": "issues.title",
+    }
+    sort_expr = allowed_sort.get(sort_by, "issues.created_at")
+
+    query = """
+        SELECT issues.*, users.name AS customer_name, users.email AS customer_email,
+               issue_ratings.rating AS customer_rating, issue_ratings.feedback AS customer_feedback
+        FROM issues
+        JOIN users ON issues.user_id = users.id
+        LEFT JOIN issue_ratings ON issue_ratings.issue_id = issues.id
+        WHERE 1=1
+    """
+    params = []
+
+    if status_filter:
+        query += " AND issues.status = %s"
+        params.append(status_filter)
+
+    if priority_filter:
+        query += " AND issues.priority = %s"
+        params.append(priority_filter)
+
+    query += f" ORDER BY {sort_expr} {sort_dir_sql}"
+
+    cur = mysql.connection.cursor()
+    cur.execute(query, tuple(params))
+    issues = cur.fetchall()
+    cur.close()
+    attach_files_to_issues(issues)
+
+    return render_template(
+        "admin_issues.html",
+        issues=issues,
+        status_filter=status_filter,
+        priority_filter=priority_filter,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+    )
+
+
+@app.route("/issues/check-duplicate", methods=["POST"])
+@login_required(role="customer")
+def check_duplicate_issue():
+    """Check if similar issues already exist for the user."""
+    title = request.form.get("title", "").strip().lower()
+    description = request.form.get("description", "").strip().lower()
+    category = request.form.get("category", "").strip()
+
+    if len(title) < 4:
+        return jsonify({"duplicates": [], "exact_duplicate": False, "has_similar": False, "blocked": False})
+
+    normalized_title = " ".join(title.split())
+    normalized_description = " ".join(description.split())
+
+    exact_duplicate = False
+    if normalized_description:
+        cur = mysql.connection.cursor()
+        cur.execute(
+            """
+            SELECT id
+            FROM issues
+            WHERE user_id = %s
+              AND LOWER(TRIM(title)) = %s
+              AND LOWER(TRIM(description)) = %s
+              AND (%s = '' OR category = %s)
+            LIMIT 1
+            """,
+            (session["user_id"], normalized_title, normalized_description, category, category),
+        )
+        exact_duplicate = cur.fetchone() is not None
+        cur.close()
+
+    cur = mysql.connection.cursor()
+    cur.execute(
+        """
+        SELECT id, title, status, created_at
+        FROM issues
+        WHERE user_id = %s
+          AND (LOWER(title) LIKE %s OR LOWER(description) LIKE %s)
+          AND (%s = '' OR category = %s)
+        ORDER BY created_at DESC
+        LIMIT 5
+        """,
+        (session["user_id"], f"%{normalized_title}%", f"%{normalized_title}%", category, category),
+    )
+    rows = cur.fetchall()
+    cur.close()
+
+    return jsonify(
+        {
+            "exact_duplicate": exact_duplicate,
+            "has_similar": len(rows) > 0,
+            "blocked": exact_duplicate or len(rows) > 0,
+            "duplicates": [
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "status": row["status"],
+                    "created_at": row["created_at"].strftime("%Y-%m-%d %H:%M"),
+                }
+                for row in rows
+            ]
+        }
+    )
+
+
+@app.route("/admin/issues/<int:issue_id>/delete", methods=["POST"])
+@login_required(role="admin")
+def delete_admin_issue(issue_id):
+    """Allow admin to delete any issue."""
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT id FROM issues WHERE id = %s", (issue_id,))
+    issue = cur.fetchone()
+    if not issue:
+        cur.close()
+        flash("Issue not found.", "danger")
+        return redirect(url_for("admin_issues"))
+
+    cur.execute("DELETE FROM issues WHERE id = %s", (issue_id,))
+    mysql.connection.commit()
+    cur.close()
+    flash("Issue deleted successfully by admin.", "success")
+    return redirect(url_for("admin_issues"))
+
+
+@app.route("/admin/issues/export.csv")
+@login_required(role="admin")
+def export_issues_csv():
+    """Export filtered admin issues to CSV report."""
+    status_filter = request.args.get("status", "").strip()
+    priority_filter = request.args.get("priority", "").strip()
+
+    query = """
+        SELECT issues.*, users.name AS customer_name, users.email AS customer_email
+        FROM issues
+        JOIN users ON issues.user_id = users.id
+        WHERE 1=1
+    """
+    params = []
+
+    if status_filter:
+        query += " AND issues.status = %s"
+        params.append(status_filter)
+
+    if priority_filter:
+        query += " AND issues.priority = %s"
+        params.append(priority_filter)
+
+    query += " ORDER BY issues.created_at DESC"
+
+    cur = mysql.connection.cursor()
+    cur.execute(query, tuple(params))
+    issues = cur.fetchall()
+    cur.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "Issue ID",
+            "Customer Name",
+            "Customer Email",
+            "Title",
+            "Category",
+            "Priority",
+            "Status",
+            "Admin Remark",
+            "Attachments",
+            "Created At",
+        ]
+    )
+
+    for issue in issues:
+        attachments = ", ".join(parse_attachments(issue.get("file_path")))
+        writer.writerow(
+            [
+                issue["id"],
+                issue["customer_name"],
+                issue["customer_email"],
+                issue["title"],
+                issue["category"],
+                issue["priority"],
+                issue["status"],
+                issue.get("remark") or "",
+                attachments,
+                issue["created_at"].strftime("%Y-%m-%d %H:%M:%S"),
+            ]
+        )
+
+    csv_data = output.getvalue()
+    output.close()
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=issues_report_{timestamp}.csv"},
+    )
+
+
+@app.route("/admin/issues/<int:issue_id>/update", methods=["POST"])
+@login_required(role="admin")
+def update_issue(issue_id):
+    """Admin updates issue status and remarks."""
+    status = request.form.get("status", "").strip()
+    remark = request.form.get("remark", "").strip()
+
+    if status not in {"Open", "In Progress", "Resolved"}:
+        flash("Invalid status value.", "danger")
+        return redirect(url_for("admin_issues"))
+
+    cur = mysql.connection.cursor()
+    cur.execute(
+        "UPDATE issues SET status = %s, remark = %s WHERE id = %s",
+        (status, remark, issue_id),
+    )
+    mysql.connection.commit()
+    cur.close()
+
+    flash("Issue updated successfully.", "success")
+    return redirect(url_for("admin_issues"))
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+===== FILE: requirements.txt =====
+
+Flask==3.0.3
+flask-mysqldb==2.0.0
+mysqlclient==2.2.4
+Werkzeug==3.0.4
+
+===== FILE: schema.sql =====
+
+CREATE DATABASE IF NOT EXISTS customer_issue_tracking;
+USE customer_issue_tracking;
+
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(150) NOT NULL UNIQUE,
+    password VARCHAR(255) NOT NULL,
+    role ENUM('customer', 'admin') NOT NULL DEFAULT 'customer'
+);
+
+CREATE TABLE IF NOT EXISTS issues (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    title VARCHAR(200) NOT NULL,
+    category VARCHAR(100) NOT NULL,
+    priority ENUM('Low', 'Medium', 'High', 'Critical') NOT NULL,
+    description TEXT NOT NULL,
+    status ENUM('Open', 'In Progress', 'Resolved') NOT NULL DEFAULT 'Open',
+    remark TEXT,
+    file_path VARCHAR(255),
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_issues_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS issue_ratings (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    issue_id INT NOT NULL UNIQUE,
+    user_id INT NOT NULL,
+    rating TINYINT NOT NULL,
+    feedback TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_issue_ratings_issue FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+    CONSTRAINT fk_issue_ratings_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Default admin account:
+-- email: admin@example.com
+-- password: admin123
+INSERT INTO users (name, email, password, role)
+VALUES (
+    'System Admin',
+    'admin@example.com',
+    'admin123',
+    'admin'
+)
+ON DUPLICATE KEY UPDATE email = email;
+
+===== FILE: templates/base.html =====
+
+{% set role = session.get('role') %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title if title else "Customer Issue Tracking System" }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container nav-wrap">
+            <a href="{{ url_for('home') }}" class="brand">Customer Issue Tracking System</a>
+            <nav class="main-nav">
+                <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle theme">Dark Mode</button>
+                {% if role == "customer" %}
+                    <a class="{% if request.path.startswith('/customer/dashboard') %}active{% endif %}" href="{{ url_for('customer_dashboard') }}">Dashboard</a>
+                    <a class="{% if request.path.startswith('/issues/new') %}active{% endif %}" href="{{ url_for('create_issue') }}">New Issue</a>
+                    <a class="{% if request.path.startswith('/customer/issues') %}active{% endif %}" href="{{ url_for('customer_issues') }}">My Issues</a>
+                    <a href="{{ url_for('logout') }}">Logout</a>
+                {% elif role == "admin" %}
+                    <a class="{% if request.path.startswith('/admin/dashboard') %}active{% endif %}" href="{{ url_for('admin_dashboard') }}">Dashboard</a>
+                    <a class="{% if request.path.startswith('/admin/issues') %}active{% endif %}" href="{{ url_for('admin_issues') }}">Manage Issues</a>
+                    <a href="{{ url_for('logout') }}">Logout</a>
+                {% else %}
+                    <a class="{% if request.path.startswith('/login') %}active{% endif %}" href="{{ url_for('customer_login') }}">Customer Login</a>
+                    <a class="{% if request.path.startswith('/register') %}active{% endif %}" href="{{ url_for('register') }}">Register</a>
+                    <a class="{% if request.path.startswith('/admin/login') %}active{% endif %}" href="{{ url_for('admin_login') }}">Admin Login</a>
+                {% endif %}
+            </nav>
+        </div>
+    </header>
+
+    <main class="container app-main">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="flash-wrap">
+                    {% for category, message in messages %}
+                        <div class="flash flash-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+    <footer class="site-footer">
+        <div class="container footer-wrap">
+            <p>Customer Issue Tracking System</p>
+            <p>Built for faster support resolution</p>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+
+===== FILE: templates/index.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div class="hero-grid">
+        <div class="hero-content">
+            <h1>Customer Issue Tracking System</h1>
+            <p>Track customer issues from submission to resolution with a clear workflow.</p>
+            <div class="hero-actions">
+                <a class="btn" href="{{ url_for('customer_login') }}">Customer Login</a>
+                <a class="btn btn-outline" href="{{ url_for('admin_login') }}">Admin Login</a>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="landing-stats">
+    <article class="landing-stat">
+        <h3>Faster Support Flow</h3>
+        <p>Track and resolve issues with a structured process from submission to closure.</p>
+    </article>
+    <article class="landing-stat">
+        <h3>Role-Based Access</h3>
+        <p>Customers and admins get focused views, actions, and dashboards for their tasks.</p>
+    </article>
+    <article class="landing-stat">
+        <h3>Smart Reporting</h3>
+        <p>Export issue data and monitor trends by priority, status, and category.</p>
+    </article>
+</section>
+
+<section class="feature-section">
+    <h2>Core Features</h2>
+    <div class="feature-grid">
+        <article class="feature-card">
+            <h3>Customer Self Service</h3>
+            <p>Raise issues, attach files, track status, and reopen resolved items with reason.</p>
+        </article>
+        <article class="feature-card">
+            <h3>Admin Issue Control</h3>
+            <p>Filter by priority/status, update progress, add remarks, and export CSV reports.</p>
+        </article>
+        <article class="feature-card">
+            <h3>Secure Access</h3>
+            <p>Session authentication, password hashing, and reset flow with signed tokens.</p>
+        </article>
+        <article class="feature-card">
+            <h3>Responsive Interface</h3>
+            <p>Clean layout, theme switcher, mobile support, and interactive dashboards.</p>
+        </article>
+    </div>
+</section>
+
+<section class="landing-cta card">
+    <h2>Start Managing Customer Issues Better</h2>
+    <p class="muted-note">Create an account, submit your first issue, and track it in real time.</p>
+    <div class="hero-actions">
+        <a class="btn" href="{{ url_for('register') }}">Create Customer Account</a>
+        <a class="btn btn-outline" href="{{ url_for('customer_login') }}">Go to Login</a>
+    </div>
+</section>
+{% endblock %}
+
+===== FILE: templates/login.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<section class="auth-shell">
+    <aside class="auth-visual photo-customer">
+        <div class="auth-visual-content">
+            <h2>Track Every Customer Issue</h2>
+            <p>Sign in to submit issues, attach documents, and monitor status in one place.</p>
+            <div class="auth-chip-row">
+                <span class="auth-chip">Fast Tickets</span>
+                <span class="auth-chip">Live Status</span>
+                <span class="auth-chip">Secure Access</span>
+            </div>
+        </div>
+    </aside>
+    <div class="card auth-card">
+        <h2>Customer Login</h2>
+        <form method="post" class="form-grid">
+            <label>Email
+                <input type="email" name="email" required>
+            </label>
+            <label>Password
+                <input type="password" name="password" required>
+            </label>
+            <button type="submit" class="btn">Login</button>
+            <a class="btn btn-outline" href="{{ url_for('forgot_password') }}">Forgot Password?</a>
+        </form>
+        <p class="muted-note auth-footnote auth-divider">New user? <a href="{{ url_for('register') }}">Create account</a></p>
+    </div>
+</section>
+{% endblock %}
+
+===== FILE: templates/register.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<section class="auth-shell">
+    <aside class="auth-visual photo-register">
+        <div class="auth-visual-content">
+            <h2>Welcome to Smarter Support</h2>
+            <p>Create your account to raise issues quickly and keep your support history organized.</p>
+            <div class="auth-chip-row">
+                <span class="auth-chip">Easy Signup</span>
+                <span class="auth-chip">Attachment Support</span>
+                <span class="auth-chip">Status Tracking</span>
+            </div>
+        </div>
+    </aside>
+    <div class="card auth-card">
+        <h2>Create Customer Account</h2>
+        <form method="post" class="form-grid">
+            <label>Name
+                <input type="text" name="name" required>
+            </label>
+            <label>Email
+                <input type="email" name="email" required>
+            </label>
+            <label>Password
+                <input type="password" name="password" minlength="6" required>
+            </label>
+            <label>Confirm Password
+                <input type="password" name="confirm_password" minlength="6" required>
+            </label>
+            <button type="submit" class="btn">Register</button>
+        </form>
+        <p class="muted-note auth-footnote">Already registered? <a href="{{ url_for('customer_login') }}">Login</a></p>
+    </div>
+</section>
+{% endblock %}
+
+===== FILE: templates/admin_login.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<section class="auth-shell">
+    <aside class="auth-visual photo-admin">
+        <div class="auth-visual-content">
+            <h2>Admin Control Center</h2>
+            <p>Access dashboards, assign priorities, update statuses, and close issues faster.</p>
+            <div class="auth-chip-row">
+                <span class="auth-chip">Issue Analytics</span>
+                <span class="auth-chip">Team Workflow</span>
+                <span class="auth-chip">CSV Reports</span>
+            </div>
+        </div>
+    </aside>
+    <div class="card auth-card">
+        <h2>Admin Login</h2>
+        <form method="post" class="form-grid">
+            <label>Email
+                <input type="email" name="email" required>
+            </label>
+            <label>Password
+                <input type="password" name="password" required>
+            </label>
+            <button type="submit" class="btn">Login as Admin</button>
+            <a class="btn btn-outline" href="{{ url_for('forgot_password') }}">Forgot Password?</a>
+        </form>
+    </div>
+</section>
+{% endblock %}
+
+===== FILE: templates/forgot_password.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<section class="auth-shell">
+    <aside class="auth-visual photo-security">
+        <div class="auth-visual-content">
+            <h2>Secure Password Recovery</h2>
+            <p>Generate a reset link and update your password in a secure, time-limited flow.</p>
+            <div class="auth-chip-row">
+                <span class="auth-chip">Token Protected</span>
+                <span class="auth-chip">Time Limited</span>
+                <span class="auth-chip">Quick Recovery</span>
+            </div>
+        </div>
+    </aside>
+    <div class="card auth-card">
+        <h2>Forgot Password</h2>
+        <p class="muted-note">Enter your registered email to generate a password reset link.</p>
+        <form method="post" class="form-grid">
+            <label>Email
+                <input type="email" name="email" required>
+            </label>
+            <button type="submit" class="btn">Generate Reset Link</button>
+            <a class="btn btn-outline" href="{{ url_for('customer_login') }}">Back to Login</a>
+        </form>
+        {% if reset_link %}
+        <div class="auth-link-box">
+            <p><strong>Reset Link (demo):</strong></p>
+            <a href="{{ reset_link }}">{{ reset_link }}</a>
+        </div>
+        {% endif %}
+    </div>
+</section>
+{% endblock %}
+
+===== FILE: templates/reset_password.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<section class="auth-shell">
+    <aside class="auth-visual photo-security">
+        <div class="auth-visual-content">
+            <h2>Set a New Password</h2>
+            <p>Choose a strong password and keep your account secure.</p>
+            <div class="auth-chip-row">
+                <span class="auth-chip">Minimum 6 chars</span>
+                <span class="auth-chip">Encrypted Storage</span>
+                <span class="auth-chip">Safe Login</span>
+            </div>
+        </div>
+    </aside>
+    <div class="card auth-card">
+        <h2>Reset Password</h2>
+        <form method="post" class="form-grid">
+            <label>New Password
+                <input type="password" name="password" minlength="6" required>
+            </label>
+            <label>Confirm New Password
+                <input type="password" name="confirm_password" minlength="6" required>
+            </label>
+            <button type="submit" class="btn">Reset Password</button>
+        </form>
+    </div>
+</section>
+{% endblock %}
+
+===== FILE: templates/customer_dashboard.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<section class="dashboard-hero-grid">
+    <article class="card dashboard-intro">
+        <h2>Customer Dashboard</h2>
+        <p class="muted-note">Track every ticket clearly with status, priority, and timeline updates.</p>
+        <div class="hero-actions">
+            <a href="{{ url_for('create_issue') }}" class="btn">Create New Issue</a>
+            <a href="{{ url_for('customer_issues') }}" class="btn btn-outline">View All Issues</a>
+        </div>
+    </article>
+    <article class="card dashboard-image-card">
+        <img src="{{ url_for('static', filename='images/support-illustration.svg') }}" alt="Support dashboard illustration">
+    </article>
+</section>
+
+<section class="dashboard-head">
+    <h3>Overview</h3>
+</section>
+
+<section class="stats-grid">
+    <article class="card stat-card">
+        <img class="stat-icon" src="{{ url_for('static', filename='images/issues-icon.svg') }}" alt="Total issues">
+        <h3>Total Issues</h3>
+        <p>{{ total_issues }}</p>
+    </article>
+    <article class="card stat-card">
+        <img class="stat-icon" src="{{ url_for('static', filename='images/active-icon.svg') }}" alt="Active issues">
+        <h3>Active Issues</h3>
+        <p>{{ active_issues }}</p>
+    </article>
+</section>
+
+<section class="card">
+    <h3>Recent Issues</h3>
+    <div class="issues-grid">
+        {% for issue in recent_issues %}
+        <article class="issue-item" tabindex="0" role="button" aria-expanded="false">
+            <div class="issue-item-head">
+                <h4>{{ issue.title }}</h4>
+                <span class="badge priority-{{ issue.priority|lower|replace(' ', '-') }}">{{ issue.priority }}</span>
+            </div>
+            <div class="issue-item-meta">
+                <span>Category: <strong>{{ issue.category }}</strong></span>
+                <span>Status: <span class="badge status-{{ issue.status|lower|replace(' ', '-') }}">{{ issue.status }}</span></span>
+            </div>
+            <p class="issue-item-date">Submitted: {{ issue.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+            <p class="issue-item-hint">Tap to view full details</p>
+            <div class="issue-item-details">
+                <p><strong>Description:</strong> {{ issue.description }}</p>
+                <p><strong>Admin Remark:</strong> {{ issue.remark if issue.remark else "No remark yet." }}</p>
+            </div>
+        </article>
+        {% else %}
+        <p>No issues submitted yet.</p>
+        {% endfor %}
+    </div>
+</section>
+{% endblock %}
+
+===== FILE: templates/create_issue.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>Submit New Issue</h2>
+    <form method="post" enctype="multipart/form-data" id="issue-form" class="form-grid">
+        <label>Issue Title
+            <input type="text" name="title" id="title" maxlength="200" required>
+        </label>
+        <div id="duplicate-warning" class="duplicate-warning" hidden></div>
+
+        <label>Category
+            <select name="category" required>
+                <option value="">Select category</option>
+                <option>Technical</option>
+                <option>Billing</option>
+                <option>Account</option>
+                <option>Service</option>
+                <option>Other</option>
+            </select>
+        </label>
+
+        <label>Priority
+            <select name="priority" required>
+                <option value="">Select priority</option>
+                <option>Low</option>
+                <option>Medium</option>
+                <option>High</option>
+                <option>Critical</option>
+            </select>
+        </label>
+
+        <label>Description
+            <textarea name="description" id="description" rows="6" required></textarea>
+        </label>
+
+        <label>Optional Attachments (up to 5 files, max 5 MB each)
+            <input type="file" name="attachments" id="attachments" multiple accept=".png,.jpg,.jpeg,.pdf,.doc,.docx,.txt">
+        </label>
+        <small class="muted-note">Allowed: PNG, JPG, PDF, DOC, DOCX, TXT</small>
+        <div id="attachment-preview" class="attachment-preview"></div>
+
+        <button type="submit" class="btn">Submit Issue</button>
+    </form>
+</div>
+{% endblock %}
+
+===== FILE: templates/customer_issues.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>My Issues</h2>
+    <div class="filter-bar">
+        <button type="button" class="btn btn-outline btn-small table-compact-toggle" data-target="customer-issues-table">Compact Mode</button>
+    </div>
+    <div class="table-wrap">
+        <table id="customer-issues-table">
+            <thead>
+                <tr>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'title' %}active{% endif %}" href="{{ url_for('customer_issues', sort_by='title', sort_dir='asc' if sort_by != 'title' or sort_dir == 'desc' else 'desc') }}">
+                            Title {% if sort_by == 'title' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Category</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'priority' %}active{% endif %}" href="{{ url_for('customer_issues', sort_by='priority', sort_dir='asc' if sort_by != 'priority' or sort_dir == 'desc' else 'desc') }}">
+                            Priority {% if sort_by == 'priority' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'status' %}active{% endif %}" href="{{ url_for('customer_issues', sort_by='status', sort_dir='asc' if sort_by != 'status' or sort_dir == 'desc' else 'desc') }}">
+                            Status {% if sort_by == 'status' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Remark</th>
+                    <th>Attachments</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'created_at' %}active{% endif %}" href="{{ url_for('customer_issues', sort_by='created_at', sort_dir='asc' if sort_by != 'created_at' or sort_dir == 'desc' else 'desc') }}">
+                            Submitted At {% if sort_by == 'created_at' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Action</th>
+                    <th>Rating</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for issue in issues %}
+                <tr>
+                    <td>{{ issue.title }}</td>
+                    <td>{{ issue.category }}</td>
+                    <td><span class="badge priority-{{ issue.priority|lower|replace(' ', '-') }}">{{ issue.priority }}</span></td>
+                    <td><span class="badge status-{{ issue.status|lower|replace(' ', '-') }}">{{ issue.status }}</span></td>
+                    <td>{{ issue.remark if issue.remark else "-" }}</td>
+                    <td>
+                        {% if issue.attachments %}
+                            <div class="attachment-list">
+                                {% for file_name in issue.attachments %}
+                                    <a href="{{ url_for('uploaded_file', filename=file_name) }}" target="_blank">View {{ loop.index }}</a>
+                                {% endfor %}
+                            </div>
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                    <td>{{ issue.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>
+                        <div class="inline-form">
+                            {% if issue.status == "Resolved" %}
+                            <form method="post" action="{{ url_for('reopen_issue', issue_id=issue.id) }}" class="inline-form">
+                                <textarea name="reopen_reason" rows="2" placeholder="Reason to reopen" required></textarea>
+                                <button type="submit" class="btn btn-small">Reopen</button>
+                            </form>
+                            {% endif %}
+                            <form method="post" action="{{ url_for('delete_customer_issue', issue_id=issue.id) }}" onsubmit="return confirm('Delete this issue permanently?');">
+                                <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                            </form>
+                        </div>
+                    </td>
+                    <td>
+                        {% if issue.status == "Resolved" %}
+                            {% if issue.rating_data %}
+                                <strong>{{ issue.rating_data.rating }}/5</strong><br>
+                                <small>{{ issue.rating_data.feedback if issue.rating_data.feedback else "No feedback" }}</small>
+                            {% else %}
+                                <form method="post" action="{{ url_for('rate_issue', issue_id=issue.id) }}" class="inline-form">
+                                    <select name="rating" required>
+                                        <option value="">Rate 1-5</option>
+                                        <option value="5">5 - Excellent</option>
+                                        <option value="4">4 - Good</option>
+                                        <option value="3">3 - Average</option>
+                                        <option value="2">2 - Poor</option>
+                                        <option value="1">1 - Very Poor</option>
+                                    </select>
+                                    <textarea name="feedback" rows="2" placeholder="Feedback (optional)"></textarea>
+                                    <button type="submit" class="btn btn-small">Submit</button>
+                                </form>
+                            {% endif %}
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="9">No issues found.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+===== FILE: templates/admin_dashboard.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<section class="dashboard-head">
+    <h2>Admin Dashboard</h2>
+    <a href="{{ url_for('admin_issues') }}" class="btn">Manage Issues</a>
+</section>
+
+<section class="stats-grid">
+    <article class="card stat-card">
+        <h3>Total Issues</h3>
+        <p>{{ total_issues }}</p>
+    </article>
+    <article class="card stat-card">
+        <h3>Open/In Progress</h3>
+        <p>{{ open_issues }}</p>
+    </article>
+    <article class="card stat-card">
+        <h3>Resolved</h3>
+        <p>{{ resolved_issues }}</p>
+    </article>
+</section>
+
+<section class="card">
+    <h3>Issue Distribution (Bar Chart)</h3>
+    <p class="muted-note">Quick view of total, active, and resolved issues.</p>
+    <div class="chart-wrap">
+        <canvas id="issueChart" data-total="{{ total_issues }}" data-open="{{ open_issues }}" data-resolved="{{ resolved_issues }}"></canvas>
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="{{ url_for('static', filename='js/admin_dashboard.js') }}"></script>
+{% endblock %}
+
+===== FILE: templates/admin_issues.html =====
+
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>Manage Issues</h2>
+
+    <div class="pill-bar">
+        <a class="pill {% if not status_filter %}active{% endif %}" href="{{ url_for('admin_issues', priority=priority_filter) }}">All Statuses</a>
+        <a class="pill {% if status_filter == 'Open' %}active{% endif %}" href="{{ url_for('admin_issues', status='Open', priority=priority_filter) }}">Open</a>
+        <a class="pill {% if status_filter == 'In Progress' %}active{% endif %}" href="{{ url_for('admin_issues', status='In Progress', priority=priority_filter) }}">In Progress</a>
+        <a class="pill {% if status_filter == 'Resolved' %}active{% endif %}" href="{{ url_for('admin_issues', status='Resolved', priority=priority_filter) }}">Resolved</a>
+    </div>
+
+    <form method="get" class="filter-bar">
+        <select name="status">
+            <option value="">Filter by status</option>
+            <option value="Open" {% if status_filter == 'Open' %}selected{% endif %}>Open</option>
+            <option value="In Progress" {% if status_filter == 'In Progress' %}selected{% endif %}>In Progress</option>
+            <option value="Resolved" {% if status_filter == 'Resolved' %}selected{% endif %}>Resolved</option>
+        </select>
+
+        <select name="priority">
+            <option value="">Filter by priority</option>
+            <option value="Low" {% if priority_filter == 'Low' %}selected{% endif %}>Low</option>
+            <option value="Medium" {% if priority_filter == 'Medium' %}selected{% endif %}>Medium</option>
+            <option value="High" {% if priority_filter == 'High' %}selected{% endif %}>High</option>
+            <option value="Critical" {% if priority_filter == 'Critical' %}selected{% endif %}>Critical</option>
+        </select>
+
+        <button type="submit" class="btn btn-small">Apply</button>
+        <a href="{{ url_for('admin_issues') }}" class="btn btn-outline btn-small">Reset</a>
+        <a href="{{ url_for('export_issues_csv', status=status_filter, priority=priority_filter) }}" class="btn btn-small">Export CSV</a>
+        <button type="button" class="btn btn-outline btn-small table-compact-toggle" data-target="admin-issues-table">Compact Mode</button>
+    </form>
+
+    <div class="table-wrap">
+        <table id="admin-issues-table">
+            <thead>
+                <tr>
+                    <th>Customer</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'title' %}active{% endif %}" href="{{ url_for('admin_issues', status=status_filter, priority=priority_filter, sort_by='title', sort_dir='asc' if sort_by != 'title' or sort_dir == 'desc' else 'desc') }}">
+                            Title {% if sort_by == 'title' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Category</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'priority' %}active{% endif %}" href="{{ url_for('admin_issues', status=status_filter, priority=priority_filter, sort_by='priority', sort_dir='asc' if sort_by != 'priority' or sort_dir == 'desc' else 'desc') }}">
+                            Priority {% if sort_by == 'priority' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'status' %}active{% endif %}" href="{{ url_for('admin_issues', status=status_filter, priority=priority_filter, sort_by='status', sort_dir='asc' if sort_by != 'status' or sort_dir == 'desc' else 'desc') }}">
+                            Status {% if sort_by == 'status' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Description</th>
+                    <th>Attachments</th>
+                    <th>Rating</th>
+                    <th>Feedback</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'created_at' %}active{% endif %}" href="{{ url_for('admin_issues', status=status_filter, priority=priority_filter, sort_by='created_at', sort_dir='asc' if sort_by != 'created_at' or sort_dir == 'desc' else 'desc') }}">
+                            Submitted At {% if sort_by == 'created_at' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Update</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for issue in issues %}
+                <tr>
+                    <td>{{ issue.customer_name }}<br><small>{{ issue.customer_email }}</small></td>
+                    <td>{{ issue.title }}</td>
+                    <td>{{ issue.category }}</td>
+                    <td><span class="badge priority-{{ issue.priority|lower|replace(' ', '-') }}">{{ issue.priority }}</span></td>
+                    <td><span class="badge status-{{ issue.status|lower|replace(' ', '-') }}">{{ issue.status }}</span></td>
+                    <td>{{ issue.description }}</td>
+                    <td>
+                        {% if issue.attachments %}
+                            <div class="attachment-list">
+                                {% for file_name in issue.attachments %}
+                                    <a href="{{ url_for('uploaded_file', filename=file_name) }}" target="_blank">View {{ loop.index }}</a>
+                                {% endfor %}
+                            </div>
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                    <td>{{ issue.customer_rating if issue.customer_rating else '-' }}</td>
+                    <td>{{ issue.customer_feedback if issue.customer_feedback else '-' }}</td>
+                    <td>{{ issue.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>
+                        <div class="inline-form">
+                            <form method="post" action="{{ url_for('update_issue', issue_id=issue.id) }}" class="inline-form">
+                                <select name="status" required>
+                                    <option value="Open" {% if issue.status == 'Open' %}selected{% endif %}>Open</option>
+                                    <option value="In Progress" {% if issue.status == 'In Progress' %}selected{% endif %}>In Progress</option>
+                                    <option value="Resolved" {% if issue.status == 'Resolved' %}selected{% endif %}>Resolved</option>
+                                </select>
+                                <textarea name="remark" rows="2" placeholder="Add remark">{{ issue.remark }}</textarea>
+                                <button type="submit" class="btn btn-small">Save</button>
+                            </form>
+                            <form method="post" action="{{ url_for('delete_admin_issue', issue_id=issue.id) }}" onsubmit="return confirm('Admin delete this issue permanently?');">
+                                <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="11">No issues match the selected filters.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+===== FILE: static/css/style.css =====
+
+:root {
+    --bg: #f4f7ff;
+    --surface: #ffffff;
+    --primary: #0f62fe;
+    --primary-dark: #0043ce;
+    --secondary: #ff7a00;
+    --accent: #00a389;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --border: #dbe4ff;
+    --success: #0f766e;
+    --warning: #b45309;
+    --danger: #b91c1c;
+}
+
+[data-theme="dark"] {
+    --bg: #0b1220;
+    --surface: #131d30;
+    --primary: #63a4ff;
+    --primary-dark: #3b82f6;
+    --secondary: #ff9d47;
+    --accent: #2dd4bf;
+    --text: #e5ecff;
+    --muted: #9fb0d3;
+    --border: #223252;
+    --success: #34d399;
+    --warning: #fbbf24;
+    --danger: #f87171;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: "Source Sans 3", "Trebuchet MS", sans-serif;
+    color: var(--text);
+    background:
+        radial-gradient(circle at 8% 6%, rgba(15, 98, 254, 0.18), transparent 34%),
+        radial-gradient(circle at 92% 10%, rgba(255, 122, 0, 0.14), transparent 32%),
+        linear-gradient(180deg, #eef3ff 0%, var(--bg) 100%);
+    line-height: 1.5;
+    opacity: 0.99;
+}
+
+body.page-loaded {
+    animation: pageFade 0.35s ease;
+}
+
+.container {
+    width: min(1100px, 92%);
+    margin: 0 auto;
+}
+
+.app-main {
+    min-height: calc(100vh - 146px);
+}
+
+.site-header {
+    background: linear-gradient(90deg, #ffffff 0%, #f8fbff 100%);
+    border-bottom: 1px solid #dbe6ff;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    box-shadow: 0 6px 18px rgba(18, 41, 88, 0.06);
+}
+
+.nav-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 64px;
+}
+
+.brand {
+    color: #0b3a99;
+    text-decoration: none;
+    font-family: "Manrope", "Trebuchet MS", sans-serif;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+}
+
+[data-theme="dark"] .brand {
+    color: #d6e4ff;
+}
+
+.main-nav {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+
+.main-nav a {
+    text-decoration: none;
+    color: #4a5b7a;
+    font-weight: 700;
+    padding: 6px 8px;
+    border-radius: 8px;
+    transition: all 0.2s ease;
+}
+
+.main-nav a:hover {
+    color: var(--primary);
+    background: rgba(15, 98, 254, 0.1);
+}
+
+.main-nav a.active {
+    color: #0f62fe;
+    background: rgba(15, 98, 254, 0.14);
+}
+
+.theme-toggle {
+    border: 1px solid #b7cbff;
+    background: #ffffff;
+    color: #1346b5;
+    padding: 8px 10px;
+    border-radius: 10px;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.theme-toggle:hover {
+    background: #eef4ff;
+}
+
+main.container {
+    padding: 22px 0 36px;
+}
+
+.card {
+    background: linear-gradient(180deg, #ffffff 0%, #fdfefe 100%);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 18px;
+    margin-bottom: 18px;
+    box-shadow: 0 8px 24px rgba(20, 45, 97, 0.08);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    animation: fadeInUp 0.35s ease both;
+}
+
+.card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 12px 26px rgba(20, 45, 97, 0.1);
+}
+
+.card h2,
+.card h3 {
+    margin-top: 0;
+    font-family: "Manrope", "Trebuchet MS", sans-serif;
+}
+
+h1,
+h2,
+h3,
+h4 {
+    font-family: "Manrope", "Trebuchet MS", sans-serif;
+    letter-spacing: 0.2px;
+}
+
+.hero {
+    background: linear-gradient(120deg, #0f62fe 0%, #1f7aff 45%, #0ea5e9 100%);
+    border: 1px solid rgba(255, 255, 255, 0.32);
+    border-radius: 20px;
+    padding: 34px;
+    text-align: center;
+    color: #ffffff;
+    box-shadow: 0 16px 30px rgba(13, 45, 126, 0.22);
+    animation: fadeInUp 0.45s ease both;
+}
+
+.hero-grid {
+    display: grid;
+    grid-template-columns: 1.15fr 1fr;
+    gap: 16px;
+    align-items: center;
+}
+
+.hero-content {
+    text-align: left;
+}
+
+.hero h1 {
+    margin: 0 0 10px;
+}
+
+.hero p {
+    margin: 0 0 18px;
+    color: rgba(255, 255, 255, 0.88);
+}
+
+.hero-actions {
+    display: flex;
+    gap: 12px;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+}
+
+.landing-stats {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin: 14px 0;
+}
+
+.landing-stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 14px;
+    box-shadow: 0 6px 16px rgba(20, 45, 97, 0.08);
+}
+
+.landing-stat h3 {
+    margin: 0 0 6px;
+}
+
+.landing-stat p {
+    margin: 0;
+    color: var(--muted);
+}
+
+.feature-section {
+    margin: 8px 0 16px;
+}
+
+.feature-section > h2 {
+    margin-bottom: 10px;
+}
+
+.feature-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.feature-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 14px;
+}
+
+.feature-card h3 {
+    margin: 0 0 6px;
+}
+
+.feature-card p {
+    margin: 0;
+    color: var(--muted);
+}
+
+.landing-cta {
+    text-align: center;
+}
+
+.landing-cta .hero-actions {
+    justify-content: center;
+}
+
+.hero-media {
+    display: grid;
+    place-items: center;
+}
+
+.workflow-panel {
+    width: min(300px, 100%);
+    aspect-ratio: 1 / 1;
+    display: grid;
+    gap: 8px;
+    padding: 14px;
+    border-radius: 16px;
+    background: rgba(255, 255, 255, 0.15);
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    backdrop-filter: blur(2px);
+    align-content: center;
+}
+
+.workflow-title {
+    margin: 0 0 4px;
+    text-align: center;
+    color: #ffffff;
+    font-size: 1.05rem;
+}
+
+.workflow-step {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    color: #0b2f7c;
+    font-weight: 700;
+    background: rgba(255, 255, 255, 0.92);
+    animation: pulseGlow 1.8s ease-in-out infinite;
+}
+
+.workflow-step .step-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+}
+
+.step-open .step-dot {
+    background: #0f62fe;
+}
+
+.step-progress .step-dot {
+    background: #ff7a00;
+}
+
+.step-resolved .step-dot {
+    background: #00a389;
+}
+
+.step-progress {
+    animation-delay: 0.3s;
+}
+
+.step-resolved {
+    animation-delay: 0.6s;
+}
+
+.btn {
+    display: inline-block;
+    border: 0;
+    border-radius: 10px;
+    padding: 10px 16px;
+    background: linear-gradient(90deg, var(--primary) 0%, #2b7fff 100%);
+    color: #fff;
+    text-decoration: none;
+    cursor: pointer;
+    font-weight: 700;
+    box-shadow: 0 8px 16px rgba(15, 98, 254, 0.24);
+    transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+}
+
+.btn:focus-visible,
+.theme-toggle:focus-visible,
+.main-nav a:focus-visible,
+.pill:focus-visible {
+    outline: 2px solid rgba(15, 98, 254, 0.42);
+    outline-offset: 2px;
+}
+
+.btn:hover {
+    filter: brightness(0.96);
+    transform: translateY(-1px);
+    box-shadow: 0 10px 20px rgba(15, 98, 254, 0.28);
+}
+
+.btn-outline {
+    background: #ffffff;
+    border: 1px solid #b7cbff;
+    color: var(--primary);
+    box-shadow: none;
+}
+
+.btn-small {
+    padding: 8px 10px;
+    font-size: 0.9rem;
+}
+
+.btn-danger {
+    background: linear-gradient(90deg, #dc2626 0%, #b91c1c 100%);
+    color: #fff;
+}
+
+.btn-danger:hover {
+    box-shadow: 0 10px 20px rgba(185, 28, 28, 0.3);
+}
+
+.auth-card {
+    max-width: 520px;
+    margin: 0 auto;
+}
+
+.auth-shell {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    align-items: stretch;
+}
+
+.auth-visual {
+    border-radius: 16px;
+    min-height: 460px;
+    position: relative;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.4);
+    background-size: cover;
+    background-position: center;
+}
+
+.auth-visual::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(160deg, rgba(8, 32, 76, 0.78), rgba(17, 119, 201, 0.5));
+}
+
+.photo-customer {
+    background-image: url("https://images.unsplash.com/photo-1552664730-d307ca884978?auto=format&fit=crop&w=1200&q=80");
+}
+
+.photo-register {
+    background-image: url("https://images.unsplash.com/photo-1573164713714-d95e436ab8d6?auto=format&fit=crop&w=1200&q=80");
+}
+
+.photo-admin {
+    background-image: url("https://images.unsplash.com/photo-1454165804606-c3d57bc86b40?auto=format&fit=crop&w=1200&q=80");
+}
+
+.photo-security {
+    background-image: url("https://images.unsplash.com/photo-1563986768609-322da13575f3?auto=format&fit=crop&w=1200&q=80");
+}
+
+.auth-visual-content {
+    position: absolute;
+    inset: auto 0 0 0;
+    z-index: 1;
+    padding: 18px;
+    color: #eff6ff;
+}
+
+.auth-visual-content h2 {
+    margin: 0 0 8px;
+}
+
+.auth-visual-content p {
+    margin: 0;
+    color: rgba(239, 246, 255, 0.92);
+}
+
+.auth-chip-row {
+    margin-top: 12px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.auth-chip {
+    padding: 5px 9px;
+    border-radius: 999px;
+    font-size: 0.84rem;
+    font-weight: 700;
+    color: #e8f4ff;
+    border: 1px solid rgba(232, 244, 255, 0.36);
+    background: rgba(15, 36, 76, 0.42);
+}
+
+.auth-footnote {
+    margin: 10px 0 0;
+}
+
+.auth-divider {
+    margin-top: 14px;
+    padding: 10px 0;
+    text-align: center;
+    border-top: 1px solid rgba(151, 176, 222, 0.36);
+    border-bottom: 1px solid rgba(151, 176, 222, 0.36);
+}
+
+.auth-divider a {
+    color: #ffffff;
+}
+
+[data-theme="dark"] .auth-divider {
+    border-top-color: rgba(102, 132, 189, 0.42);
+    border-bottom-color: rgba(102, 132, 189, 0.42);
+}
+
+.auth-link-box {
+    margin-top: 12px;
+    border: 1px dashed var(--border);
+    border-radius: 12px;
+    padding: 10px;
+    background: rgba(15, 98, 254, 0.04);
+    overflow-wrap: anywhere;
+}
+
+.form-grid {
+    display: grid;
+    gap: 12px;
+}
+
+label {
+    display: grid;
+    gap: 6px;
+    font-weight: 600;
+}
+
+input,
+select,
+textarea {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font: inherit;
+    background: #fff;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+    outline: 2px solid rgba(37, 99, 235, 0.2);
+    border-color: var(--primary);
+}
+
+input::placeholder,
+textarea::placeholder {
+    color: #8a97b1;
+}
+
+textarea {
+    resize: vertical;
+}
+
+.dashboard-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.dashboard-hero-grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.dashboard-intro p {
+    margin-bottom: 14px;
+}
+
+.dashboard-image-card {
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+}
+
+.dashboard-image-card img {
+    width: min(320px, 95%);
+    height: auto;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-bottom: 18px;
+}
+
+.stat-icon {
+    width: 36px;
+    height: 36px;
+    margin-bottom: 6px;
+}
+
+.stat-card h3 {
+    margin: 0;
+    color: #5f6f8b;
+    font-size: 1rem;
+}
+
+.stat-card p {
+    margin: 8px 0 0;
+    font-size: 2rem;
+    font-weight: 800;
+    background: linear-gradient(90deg, #0f62fe 0%, #00a389 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+}
+
+.table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(255, 255, 255, 0.94));
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 760px;
+}
+
+th,
+td {
+    text-align: left;
+    padding: 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+}
+
+th {
+    color: #4f5f7d;
+    background: #f4f8ff;
+    font-weight: 700;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+}
+
+.sort-link {
+    color: inherit;
+    text-decoration: none;
+    font-weight: 700;
+}
+
+.sort-link.active {
+    color: #0f62fe;
+}
+
+.sort-link:hover {
+    text-decoration: underline;
+}
+
+tbody tr:nth-child(even) {
+    background: #fcfdff;
+}
+
+tbody tr:hover {
+    background: #f5f9ff;
+}
+
+.table-row-animate {
+    animation: rowSlide 0.4s ease both;
+    animation-delay: calc(var(--row-delay) * 45ms);
+}
+
+.badge {
+    display: inline-block;
+    padding: 5px 10px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.26);
+}
+
+.status-open {
+    background: #dbeafe;
+    color: #1948a5;
+}
+
+.status-in-progress {
+    background: #ffedd5;
+    color: #9a3412;
+}
+
+.status-resolved {
+    background: #ccfbf1;
+    color: #0f766e;
+}
+
+.priority-low {
+    background: #e6edf8;
+    color: #334155;
+}
+
+.priority-medium {
+    background: #dbeafe;
+    color: #1e40af;
+}
+
+.priority-high {
+    background: #ffedd5;
+    color: #c2410c;
+}
+
+.priority-critical {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.inline-form {
+    display: grid;
+    gap: 8px;
+    min-width: 190px;
+}
+
+.inline-form textarea {
+    min-height: 56px;
+}
+
+.filter-bar {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.pill-bar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+
+.pill {
+    text-decoration: none;
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: #35517e;
+    font-weight: 700;
+    background: #f4f8ff;
+}
+
+.pill.active {
+    background: #dbeafe;
+    border-color: #a7c5ff;
+    color: #1346b5;
+}
+
+table.table-compact th,
+table.table-compact td {
+    padding: 6px 8px;
+    font-size: 0.9rem;
+}
+
+.flash-wrap {
+    margin-bottom: 14px;
+}
+
+.flash {
+    padding: 10px 12px;
+    border-radius: 10px;
+    margin-bottom: 8px;
+    border: 1px solid transparent;
+    animation: fadeInUp 0.25s ease both;
+}
+
+.site-footer {
+    border-top: 1px solid var(--border);
+    background: linear-gradient(90deg, #f8fbff 0%, #f1f6ff 100%);
+}
+
+.footer-wrap {
+    min-height: 56px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: #58729f;
+    font-weight: 600;
+    font-size: 0.94rem;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.flash-success {
+    color: var(--success);
+    background: #ecfeff;
+    border-color: #99f6e4;
+}
+
+.flash-warning {
+    color: var(--warning);
+    background: #fffbeb;
+    border-color: #fde68a;
+}
+
+.flash-danger {
+    color: var(--danger);
+    background: #fef2f2;
+    border-color: #fecaca;
+}
+
+.flash-info {
+    color: #1e40af;
+    background: #eff6ff;
+    border-color: #bfdbfe;
+}
+
+.muted-note {
+    color: var(--muted);
+    margin: -6px 0 12px;
+}
+
+.chart-wrap {
+    position: relative;
+    min-height: 280px;
+}
+
+.attachment-list {
+    display: grid;
+    gap: 4px;
+}
+
+.attachment-preview {
+    font-size: 0.92rem;
+    color: var(--muted);
+}
+
+.duplicate-warning {
+    border: 1px solid #fbbf24;
+    background: #fff7db;
+    color: #92400e;
+    border-radius: 10px;
+    padding: 10px;
+    font-size: 0.95rem;
+}
+
+.duplicate-warning ul {
+    margin: 6px 0 0 18px;
+}
+
+.duplicate-warning.duplicate-block {
+    border-color: #ef4444;
+    background: #fef2f2;
+    color: #991b1b;
+}
+
+.issues-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.issue-item {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px;
+    background: rgba(255, 255, 255, 0.7);
+    cursor: pointer;
+    transition: border-color 0.22s ease, box-shadow 0.22s ease, transform 0.22s ease;
+}
+
+.issue-item-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+
+.issue-item-head h4 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+.issue-item-meta {
+    display: grid;
+    gap: 8px;
+    margin: 10px 0;
+    color: var(--muted);
+}
+
+.issue-item-date {
+    margin: 0;
+    font-size: 0.92rem;
+    color: var(--muted);
+}
+
+.issue-item-hint {
+    margin: 8px 0 0;
+    font-size: 0.84rem;
+    color: var(--muted);
+}
+
+.issue-item-details {
+    max-height: 0;
+    overflow: hidden;
+    opacity: 0;
+    transform: translateY(-4px);
+    transition: max-height 0.26s ease, opacity 0.22s ease, transform 0.22s ease, margin-top 0.22s ease;
+}
+
+.issue-item-details p {
+    margin: 8px 0;
+}
+
+.issue-item:hover,
+.issue-item:focus {
+    border-color: #8fb4ff;
+    box-shadow: 0 10px 24px rgba(15, 98, 254, 0.18);
+    transform: translateY(-1px);
+    outline: none;
+}
+
+.issue-item.is-active {
+    border-color: #0f62fe;
+    box-shadow: 0 12px 28px rgba(15, 98, 254, 0.24);
+}
+
+.issue-item.is-active .issue-item-details {
+    max-height: 240px;
+    opacity: 1;
+    transform: translateY(0);
+    margin-top: 8px;
+}
+
+.reveal-item {
+    opacity: 0;
+    transform: translateY(14px) scale(0.99);
+    transition: opacity 0.45s ease, transform 0.45s ease;
+    transition-delay: calc(var(--delay) * 35ms);
+}
+
+.reveal-item.is-visible {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+}
+
+body[data-theme="dark"] {
+    background:
+        radial-gradient(circle at 8% 6%, rgba(99, 164, 255, 0.12), transparent 34%),
+        radial-gradient(circle at 92% 10%, rgba(255, 157, 71, 0.08), transparent 32%),
+        linear-gradient(180deg, #0a1324 0%, #0b1220 100%);
+}
+
+[data-theme="dark"] .site-header {
+    background: linear-gradient(90deg, #101a2f 0%, #111e34 100%);
+    border-bottom-color: #203151;
+}
+
+[data-theme="dark"] .main-nav a {
+    color: #b9c8ea;
+}
+
+[data-theme="dark"] .main-nav a:hover {
+    color: #dbe8ff;
+    background: rgba(99, 164, 255, 0.18);
+}
+
+[data-theme="dark"] .main-nav a.active {
+    color: #dbe8ff;
+    background: rgba(99, 164, 255, 0.26);
+}
+
+[data-theme="dark"] .theme-toggle {
+    background: #16243d;
+    border-color: #2a4068;
+    color: #d3e3ff;
+}
+
+[data-theme="dark"] .theme-toggle:hover {
+    background: #1a2c4a;
+}
+
+[data-theme="dark"] .card {
+    background: linear-gradient(180deg, #131d30 0%, #142039 100%);
+    box-shadow: 0 10px 28px rgba(2, 8, 23, 0.45);
+}
+
+[data-theme="dark"] .auth-link-box {
+    border-color: #2a4068;
+    background: rgba(24, 43, 75, 0.65);
+}
+
+[data-theme="dark"] .landing-stat,
+[data-theme="dark"] .feature-card {
+    background: linear-gradient(180deg, #131d30 0%, #142039 100%);
+    border-color: #223252;
+}
+
+[data-theme="dark"] .workflow-panel {
+    background: rgba(16, 28, 48, 0.55);
+    border-color: rgba(163, 186, 233, 0.28);
+}
+
+[data-theme="dark"] .workflow-step {
+    background: rgba(17, 32, 56, 0.95);
+    color: #dbe8ff;
+}
+
+[data-theme="dark"] .issue-item {
+    background: rgba(16, 28, 48, 0.8);
+}
+
+[data-theme="dark"] .issue-item:hover,
+[data-theme="dark"] .issue-item:focus {
+    border-color: #4f79c9;
+    box-shadow: 0 12px 24px rgba(2, 8, 23, 0.5);
+}
+
+[data-theme="dark"] .issue-item.is-active {
+    border-color: #63a4ff;
+    box-shadow: 0 12px 26px rgba(99, 164, 255, 0.3);
+}
+
+[data-theme="dark"] .duplicate-warning {
+    border-color: #f59e0b;
+    background: rgba(146, 64, 14, 0.25);
+    color: #ffd99a;
+}
+
+[data-theme="dark"] .duplicate-warning.duplicate-block {
+    border-color: #f87171;
+    background: rgba(127, 29, 29, 0.42);
+    color: #fecaca;
+}
+
+[data-theme="dark"] input,
+[data-theme="dark"] select,
+[data-theme="dark"] textarea {
+    background: #0f1a2e;
+    color: var(--text);
+    border-color: #2a4068;
+}
+
+[data-theme="dark"] input::placeholder,
+[data-theme="dark"] textarea::placeholder {
+    color: #7e94bf;
+}
+
+[data-theme="dark"] th {
+    background: #16243f;
+    color: #cad7f3;
+}
+
+[data-theme="dark"] .table-wrap {
+    background: linear-gradient(180deg, rgba(17, 32, 56, 0.82), rgba(17, 32, 56, 0.94));
+}
+
+[data-theme="dark"] .site-footer {
+    border-top-color: #223252;
+    background: linear-gradient(90deg, #101b30 0%, #0f1b2f 100%);
+}
+
+[data-theme="dark"] .footer-wrap {
+    color: #9eb2d8;
+}
+
+[data-theme="dark"] .sort-link.active {
+    color: #63a4ff;
+}
+
+[data-theme="dark"] .pill {
+    background: #14233c;
+    border-color: #2a4068;
+    color: #bdd1f5;
+}
+
+[data-theme="dark"] .pill.active {
+    background: #1f365d;
+    border-color: #4f79c9;
+    color: #dbe8ff;
+}
+
+[data-theme="dark"] tbody tr:nth-child(even) {
+    background: #121e34;
+}
+
+[data-theme="dark"] tbody tr:hover {
+    background: #1a2a46;
+}
+
+@media (max-width: 900px) {
+    .auth-shell {
+        grid-template-columns: 1fr;
+    }
+
+    .auth-visual {
+        min-height: 260px;
+    }
+
+    .hero-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .hero-content {
+        text-align: center;
+    }
+
+    .hero-actions {
+        justify-content: center;
+    }
+
+    .workflow-panel {
+        width: min(360px, 100%);
+        aspect-ratio: auto;
+    }
+
+    .landing-stats {
+        grid-template-columns: 1fr;
+    }
+
+    .feature-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .dashboard-hero-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .stats-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .issues-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .nav-wrap {
+        flex-direction: column;
+        justify-content: center;
+        padding: 10px 0;
+        gap: 10px;
+    }
+
+    .footer-wrap {
+        justify-content: center;
+        text-align: center;
+    }
+}
+
+@keyframes fadeInUp {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes pulseGlow {
+    0%, 100% {
+        transform: translateY(0);
+        box-shadow: 0 0 0 rgba(15, 98, 254, 0.0);
+    }
+    50% {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 18px rgba(15, 98, 254, 0.18);
+    }
+}
+
+@keyframes rowSlide {
+    from {
+        opacity: 0;
+        transform: translateX(-6px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+@keyframes pageFade {
+    from {
+        opacity: 0.86;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+===== FILE: static/js/main.js =====
+
+// Client-side enhancement for simple validation and better UX.
+document.addEventListener("DOMContentLoaded", function () {
+    document.body.classList.add("page-loaded");
+
+    var themeToggle = document.getElementById("theme-toggle");
+    var body = document.body;
+    var storedTheme = localStorage.getItem("theme");
+
+    function applyTheme(theme) {
+        if (theme === "dark") {
+            body.setAttribute("data-theme", "dark");
+            if (themeToggle) {
+                themeToggle.textContent = "Light Mode";
+            }
+        } else {
+            body.removeAttribute("data-theme");
+            if (themeToggle) {
+                themeToggle.textContent = "Dark Mode";
+            }
+        }
+    }
+
+    applyTheme(storedTheme || "light");
+
+    if (themeToggle) {
+        themeToggle.addEventListener("click", function () {
+            var nextTheme = body.getAttribute("data-theme") === "dark" ? "light" : "dark";
+            localStorage.setItem("theme", nextTheme);
+            applyTheme(nextTheme);
+        });
+    }
+
+    var issueForm = document.getElementById("issue-form");
+    var issueItems = document.querySelectorAll(".issue-item");
+    var compactToggles = document.querySelectorAll(".table-compact-toggle");
+    var revealTargets = document.querySelectorAll(".card, .landing-stat, .feature-card, .issue-item, .table-wrap");
+    var tableRows = document.querySelectorAll("tbody tr");
+    var duplicateWarningBox = document.getElementById("duplicate-warning");
+
+    if (issueForm) {
+        var attachmentsPreview = document.getElementById("attachment-preview");
+        var attachmentInput = document.getElementById("attachments");
+        var titleInput = document.getElementById("title");
+        var descriptionInput = document.getElementById("description");
+        var categoryInput = issueForm.querySelector("select[name='category']");
+        var duplicateTimer = null;
+        var hasDuplicateBlocked = false;
+
+        if (attachmentInput && attachmentsPreview) {
+            attachmentInput.addEventListener("change", function () {
+                var lines = [];
+                for (var i = 0; i < attachmentInput.files.length; i += 1) {
+                    var file = attachmentInput.files[i];
+                    lines.push((i + 1) + ". " + file.name + " (" + Math.ceil(file.size / 1024) + " KB)");
+                }
+                attachmentsPreview.innerHTML = lines.length
+                    ? "<strong>Selected files:</strong><br>" + lines.join("<br>")
+                    : "";
+            });
+        }
+
+        issueForm.addEventListener("submit", function (event) {
+            var title = document.getElementById("title");
+            var description = document.getElementById("description");
+            var attachments = document.getElementById("attachments");
+
+            if (title && title.value.trim().length < 5) {
+                alert("Issue title must be at least 5 characters long.");
+                event.preventDefault();
+                return;
+            }
+
+            if (description && description.value.trim().length < 15) {
+                alert("Description must be at least 15 characters long.");
+                event.preventDefault();
+                return;
+            }
+
+            if (attachments && attachments.files.length > 5) {
+                alert("You can upload up to 5 files only.");
+                event.preventDefault();
+                return;
+            }
+
+            if (attachments) {
+                for (var i = 0; i < attachments.files.length; i += 1) {
+                    if (attachments.files[i].size > 5 * 1024 * 1024) {
+                        alert("Each file must be 5 MB or smaller.");
+                        event.preventDefault();
+                        return;
+                    }
+                }
+            }
+        });
+
+        function renderDuplicateWarning(items, blocked) {
+            if (!duplicateWarningBox) {
+                return;
+            }
+            if (!items.length) {
+                duplicateWarningBox.hidden = true;
+                duplicateWarningBox.innerHTML = "";
+                hasDuplicateBlocked = false;
+                return;
+            }
+            hasDuplicateBlocked = Boolean(blocked);
+            var listItems = items.map(function (item) {
+                return "<li><strong>" + item.title + "</strong> (" + item.status + ", " + item.created_at + ")</li>";
+            }).join("");
+            var header = "<strong>Similar issue(s) found:</strong> submission is blocked.";
+            duplicateWarningBox.innerHTML = header + "<ul>" + listItems + "</ul>";
+            duplicateWarningBox.hidden = false;
+            duplicateWarningBox.classList.toggle("duplicate-block", hasDuplicateBlocked);
+        }
+
+        function checkDuplicates() {
+            if (!titleInput || !titleInput.value || titleInput.value.trim().length < 4) {
+                renderDuplicateWarning([]);
+                return;
+            }
+            var formData = new FormData();
+            formData.append("title", titleInput.value.trim());
+            if (descriptionInput) {
+                formData.append("description", descriptionInput.value.trim());
+            }
+            if (categoryInput) {
+                formData.append("category", categoryInput.value || "");
+            }
+            fetch("/issues/check-duplicate", {
+                method: "POST",
+                body: formData,
+            })
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    renderDuplicateWarning((data && data.duplicates) || [], data && data.blocked);
+                })
+                .catch(function () {
+                    renderDuplicateWarning([], false);
+                });
+        }
+
+        if (titleInput) {
+            titleInput.addEventListener("input", function () {
+                clearTimeout(duplicateTimer);
+                duplicateTimer = setTimeout(checkDuplicates, 350);
+            });
+        }
+        if (categoryInput) {
+            categoryInput.addEventListener("change", checkDuplicates);
+        }
+        if (descriptionInput) {
+            descriptionInput.addEventListener("input", function () {
+                clearTimeout(duplicateTimer);
+                duplicateTimer = setTimeout(checkDuplicates, 350);
+            });
+        }
+
+        issueForm.addEventListener("submit", function (event) {
+            if (hasDuplicateBlocked) {
+                alert("Similar issue found. Submit blocked.");
+                event.preventDefault();
+            }
+        });
+    }
+
+    if (issueItems.length) {
+        function setActiveIssue(activeItem) {
+            issueItems.forEach(function (item) {
+                var isActive = item === activeItem;
+                item.classList.toggle("is-active", isActive);
+                item.setAttribute("aria-expanded", isActive ? "true" : "false");
+            });
+        }
+
+        issueItems.forEach(function (item) {
+            item.addEventListener("click", function () {
+                var isAlreadyActive = item.classList.contains("is-active");
+                if (isAlreadyActive) {
+                    item.classList.remove("is-active");
+                    item.setAttribute("aria-expanded", "false");
+                    return;
+                }
+                setActiveIssue(item);
+            });
+
+            item.addEventListener("keydown", function (event) {
+                if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    item.click();
+                }
+            });
+        });
+    }
+
+    if (compactToggles.length) {
+        compactToggles.forEach(function (toggleButton) {
+            toggleButton.addEventListener("click", function () {
+                var targetId = toggleButton.getAttribute("data-target");
+                var table = document.getElementById(targetId);
+                if (!table) {
+                    return;
+                }
+
+                var compactEnabled = table.classList.toggle("table-compact");
+                toggleButton.textContent = compactEnabled ? "Normal Mode" : "Compact Mode";
+            });
+        });
+    }
+
+    if (revealTargets.length && "IntersectionObserver" in window) {
+        revealTargets.forEach(function (target, index) {
+            target.classList.add("reveal-item");
+            target.style.setProperty("--delay", String(index % 8));
+        });
+
+        var observer = new IntersectionObserver(function (entries, obs) {
+            entries.forEach(function (entry) {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add("is-visible");
+                    obs.unobserve(entry.target);
+                }
+            });
+        }, { threshold: 0.12 });
+
+        revealTargets.forEach(function (target) {
+            observer.observe(target);
+        });
+    }
+
+    if (tableRows.length) {
+        tableRows.forEach(function (row, index) {
+            row.classList.add("table-row-animate");
+            row.style.setProperty("--row-delay", String(index % 12));
+        });
+    }
+});
+
+===== FILE: static/js/admin_dashboard.js =====
+
+document.addEventListener("DOMContentLoaded", function () {
+    var canvas = document.getElementById("issueChart");
+    if (!canvas || typeof Chart === "undefined") {
+        return;
+    }
+
+    var total = Number(canvas.dataset.total || 0);
+    var open = Number(canvas.dataset.open || 0);
+    var resolved = Number(canvas.dataset.resolved || 0);
+
+    var values = [total, open, resolved];
+
+    new Chart(canvas, {
+        type: "bar",
+        data: {
+            labels: ["Total", "Open/In Progress", "Resolved"],
+            datasets: [{
+                data: values,
+                backgroundColor: ["#2563eb", "#f59e0b", "#10b981"],
+                borderRadius: 8,
+                borderSkipped: false,
+                maxBarThickness: 64,
+            }],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    display: false,
+                },
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    ticks: {
+                        precision: 0,
+                    },
+                    grid: {
+                        color: "rgba(31, 41, 55, 0.08)",
+                    },
+                },
+                x: {
+                    grid: {
+                        display: false,
+                    },
+                },
+            },
+        },
+    });
+});

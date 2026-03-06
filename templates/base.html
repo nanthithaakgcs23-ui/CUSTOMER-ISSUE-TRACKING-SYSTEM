@@ -1,0 +1,62 @@
+
+{% set role = session.get('role') %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title if title else "Customer Issue Tracking System" }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container nav-wrap">
+            <a href="{{ url_for('home') }}" class="brand">Customer Issue Tracking System</a>
+            <nav class="main-nav">
+                <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle theme">Dark Mode</button>
+                {% if role == "customer" %}
+                    <a class="{% if request.path.startswith('/customer/dashboard') %}active{% endif %}" href="{{ url_for('customer_dashboard') }}">Dashboard</a>
+                    <a class="{% if request.path.startswith('/issues/new') %}active{% endif %}" href="{{ url_for('create_issue') }}">New Issue</a>
+                    <a class="{% if request.path.startswith('/customer/issues') %}active{% endif %}" href="{{ url_for('customer_issues') }}">My Issues</a>
+                    <a href="{{ url_for('logout') }}">Logout</a>
+                {% elif role == "admin" %}
+                    <a class="{% if request.path.startswith('/admin/dashboard') %}active{% endif %}" href="{{ url_for('admin_dashboard') }}">Dashboard</a>
+                    <a class="{% if request.path.startswith('/admin/issues') %}active{% endif %}" href="{{ url_for('admin_issues') }}">Manage Issues</a>
+                    <a href="{{ url_for('logout') }}">Logout</a>
+                {% else %}
+                    <a class="{% if request.path.startswith('/login') %}active{% endif %}" href="{{ url_for('customer_login') }}">Customer Login</a>
+                    <a class="{% if request.path.startswith('/register') %}active{% endif %}" href="{{ url_for('register') }}">Register</a>
+                    <a class="{% if request.path.startswith('/admin/login') %}active{% endif %}" href="{{ url_for('admin_login') }}">Admin Login</a>
+                {% endif %}
+            </nav>
+        </div>
+    </header>
+
+    <main class="container app-main">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="flash-wrap">
+                    {% for category, message in messages %}
+                        <div class="flash flash-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+    <footer class="site-footer">
+        <div class="container footer-wrap">
+            <p>Customer Issue Tracking System</p>
+            <p>Built for faster support resolution</p>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+

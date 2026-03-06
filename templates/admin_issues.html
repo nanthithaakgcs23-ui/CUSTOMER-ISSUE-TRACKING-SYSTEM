@@ -1,0 +1,119 @@
+
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>Manage Issues</h2>
+
+    <div class="pill-bar">
+        <a class="pill {% if not status_filter %}active{% endif %}" href="{{ url_for('admin_issues', priority=priority_filter) }}">All Statuses</a>
+        <a class="pill {% if status_filter == 'Open' %}active{% endif %}" href="{{ url_for('admin_issues', status='Open', priority=priority_filter) }}">Open</a>
+        <a class="pill {% if status_filter == 'In Progress' %}active{% endif %}" href="{{ url_for('admin_issues', status='In Progress', priority=priority_filter) }}">In Progress</a>
+        <a class="pill {% if status_filter == 'Resolved' %}active{% endif %}" href="{{ url_for('admin_issues', status='Resolved', priority=priority_filter) }}">Resolved</a>
+    </div>
+
+    <form method="get" class="filter-bar">
+        <select name="status">
+            <option value="">Filter by status</option>
+            <option value="Open" {% if status_filter == 'Open' %}selected{% endif %}>Open</option>
+            <option value="In Progress" {% if status_filter == 'In Progress' %}selected{% endif %}>In Progress</option>
+            <option value="Resolved" {% if status_filter == 'Resolved' %}selected{% endif %}>Resolved</option>
+        </select>
+
+        <select name="priority">
+            <option value="">Filter by priority</option>
+            <option value="Low" {% if priority_filter == 'Low' %}selected{% endif %}>Low</option>
+            <option value="Medium" {% if priority_filter == 'Medium' %}selected{% endif %}>Medium</option>
+            <option value="High" {% if priority_filter == 'High' %}selected{% endif %}>High</option>
+            <option value="Critical" {% if priority_filter == 'Critical' %}selected{% endif %}>Critical</option>
+        </select>
+
+        <button type="submit" class="btn btn-small">Apply</button>
+        <a href="{{ url_for('admin_issues') }}" class="btn btn-outline btn-small">Reset</a>
+        <a href="{{ url_for('export_issues_csv', status=status_filter, priority=priority_filter) }}" class="btn btn-small">Export CSV</a>
+        <button type="button" class="btn btn-outline btn-small table-compact-toggle" data-target="admin-issues-table">Compact Mode</button>
+    </form>
+
+    <div class="table-wrap">
+        <table id="admin-issues-table">
+            <thead>
+                <tr>
+                    <th>Customer</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'title' %}active{% endif %}" href="{{ url_for('admin_issues', status=status_filter, priority=priority_filter, sort_by='title', sort_dir='asc' if sort_by != 'title' or sort_dir == 'desc' else 'desc') }}">
+                            Title {% if sort_by == 'title' %}{{ 'â†‘' if sort_dir == 'asc' else 'â†“' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Category</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'priority' %}active{% endif %}" href="{{ url_for('admin_issues', status=status_filter, priority=priority_filter, sort_by='priority', sort_dir='asc' if sort_by != 'priority' or sort_dir == 'desc' else 'desc') }}">
+                            Priority {% if sort_by == 'priority' %}{{ 'â†‘' if sort_dir == 'asc' else 'â†“' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'status' %}active{% endif %}" href="{{ url_for('admin_issues', status=status_filter, priority=priority_filter, sort_by='status', sort_dir='asc' if sort_by != 'status' or sort_dir == 'desc' else 'desc') }}">
+                            Status {% if sort_by == 'status' %}{{ 'â†‘' if sort_dir == 'asc' else 'â†“' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Description</th>
+                    <th>Attachments</th>
+                    <th>Rating</th>
+                    <th>Feedback</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'created_at' %}active{% endif %}" href="{{ url_for('admin_issues', status=status_filter, priority=priority_filter, sort_by='created_at', sort_dir='asc' if sort_by != 'created_at' or sort_dir == 'desc' else 'desc') }}">
+                            Submitted At {% if sort_by == 'created_at' %}{{ 'â†‘' if sort_dir == 'asc' else 'â†“' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Update</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for issue in issues %}
+                <tr>
+                    <td>{{ issue.customer_name }}<br><small>{{ issue.customer_email }}</small></td>
+                    <td>{{ issue.title }}</td>
+                    <td>{{ issue.category }}</td>
+                    <td><span class="badge priority-{{ issue.priority|lower|replace(' ', '-') }}">{{ issue.priority }}</span></td>
+                    <td><span class="badge status-{{ issue.status|lower|replace(' ', '-') }}">{{ issue.status }}</span></td>
+                    <td>{{ issue.description }}</td>
+                    <td>
+                        {% if issue.attachments %}
+                            <div class="attachment-list">
+                                {% for file_name in issue.attachments %}
+                                    <a href="{{ url_for('uploaded_file', filename=file_name) }}" target="_blank">View {{ loop.index }}</a>
+                                {% endfor %}
+                            </div>
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                    <td>{{ issue.customer_rating if issue.customer_rating else '-' }}</td>
+                    <td>{{ issue.customer_feedback if issue.customer_feedback else '-' }}</td>
+                    <td>{{ issue.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>
+                        <div class="inline-form">
+                            <form method="post" action="{{ url_for('update_issue', issue_id=issue.id) }}" class="inline-form">
+                                <select name="status" required>
+                                    <option value="Open" {% if issue.status == 'Open' %}selected{% endif %}>Open</option>
+                                    <option value="In Progress" {% if issue.status == 'In Progress' %}selected{% endif %}>In Progress</option>
+                                    <option value="Resolved" {% if issue.status == 'Resolved' %}selected{% endif %}>Resolved</option>
+                                </select>
+                                <textarea name="remark" rows="2" placeholder="Add remark">{{ issue.remark }}</textarea>
+                                <button type="submit" class="btn btn-small">Save</button>
+                            </form>
+                            <form method="post" action="{{ url_for('delete_admin_issue', issue_id=issue.id) }}" onsubmit="return confirm('Admin delete this issue permanently?');">
+                                <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="11">No issues match the selected filters.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+

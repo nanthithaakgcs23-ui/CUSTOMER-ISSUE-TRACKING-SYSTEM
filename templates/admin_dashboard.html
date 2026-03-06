@@ -1,0 +1,37 @@
+
+{% extends "base.html" %}
+{% block content %}
+<section class="dashboard-head">
+    <h2>Admin Dashboard</h2>
+    <a href="{{ url_for('admin_issues') }}" class="btn">Manage Issues</a>
+</section>
+
+<section class="stats-grid">
+    <article class="card stat-card">
+        <h3>Total Issues</h3>
+        <p>{{ total_issues }}</p>
+    </article>
+    <article class="card stat-card">
+        <h3>Open/In Progress</h3>
+        <p>{{ open_issues }}</p>
+    </article>
+    <article class="card stat-card">
+        <h3>Resolved</h3>
+        <p>{{ resolved_issues }}</p>
+    </article>
+</section>
+
+<section class="card">
+    <h3>Issue Distribution (Bar Chart)</h3>
+    <p class="muted-note">Quick view of total, active, and resolved issues.</p>
+    <div class="chart-wrap">
+        <canvas id="issueChart" data-total="{{ total_issues }}" data-open="{{ open_issues }}" data-resolved="{{ resolved_issues }}"></canvas>
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="{{ url_for('static', filename='js/admin_dashboard.js') }}"></script>
+{% endblock %}
+
