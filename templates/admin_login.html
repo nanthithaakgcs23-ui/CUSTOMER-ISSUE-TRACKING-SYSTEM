@@ -1,0 +1,31 @@
+
+{% extends "base.html" %}
+{% block content %}
+<section class="auth-shell">
+    <aside class="auth-visual photo-admin">
+        <div class="auth-visual-content">
+            <h2>Admin Control Center</h2>
+            <p>Access dashboards, assign priorities, update statuses, and close issues faster.</p>
+            <div class="auth-chip-row">
+                <span class="auth-chip">Issue Analytics</span>
+                <span class="auth-chip">Team Workflow</span>
+                <span class="auth-chip">CSV Reports</span>
+            </div>
+        </div>
+    </aside>
+    <div class="card auth-card">
+        <h2>Admin Login</h2>
+        <form method="post" class="form-grid">
+            <label>Email
+                <input type="email" name="email" required>
+            </label>
+            <label>Password
+                <input type="password" name="password" required>
+            </label>
+            <button type="submit" class="btn">Login as Admin</button>
+            <a class="btn btn-outline" href="{{ url_for('forgot_password') }}">Forgot Password?</a>
+        </form>
+    </div>
+</section>
+{% endblock %}
+

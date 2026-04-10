@@ -1,0 +1,91 @@
+
+{% extends "base.html" %}
+{% block content %}
+<section class="dashboard-head">
+    <h2>Admin Dashboard</h2>
+    <a href="{{ url_for('admin_issues') }}" class="btn">Manage Issues</a>
+</section>
+
+<section class="stats-grid">
+    <article class="card stat-card">
+        <h3>Total Issues</h3>
+        <p>{{ total_issues }}</p>
+    </article>
+    <article class="card stat-card">
+        <h3>Open/In Progress</h3>
+        <p>{{ open_issues }}</p>
+    </article>
+    <article class="card stat-card">
+        <h3>Resolved</h3>
+        <p>{{ resolved_issues }}</p>
+    </article>
+</section>
+
+<section
+    class="card notifications-card"
+    data-notifications-panel
+    data-notification-feed-url="{{ url_for('notification_feed') }}"
+    data-notification-mark-read-url="{{ url_for('mark_notification_feed_read') }}"
+>
+    <div class="dashboard-head notifications-head">
+        <div>
+            <h3>Notifications</h3>
+            <p class="muted-note">New customer tickets will appear here automatically.</p>
+        </div>
+    </div>
+    <div class="notification-list" data-notification-list>
+        {% for notification in notifications %}
+        <a href="{{ notification.link }}" class="notification-item {% if not notification.is_read %}notification-unread{% endif %}">
+            <div>
+                <strong>{{ notification.message }}</strong>
+                <p>{{ notification.created_at }}</p>
+            </div>
+            <span class="notification-link">Open</span>
+        </a>
+        {% else %}
+        <p class="notification-empty" data-notification-empty>No notifications yet.</p>
+        {% endfor %}
+    </div>
+</section>
+
+<section class="card">
+    <div
+        id="admin-dashboard-charts"
+        data-summary='{{ {"labels": ["Total", "Open/In Progress", "Resolved"], "values": [total_issues, open_issues, resolved_issues]} | tojson }}'
+        data-status='{{ status_chart | tojson }}'
+        data-priority='{{ priority_chart | tojson }}'
+        data-trend='{{ trend_chart | tojson }}'
+    >
+        <h3>Issue Analytics</h3>
+        <p class="muted-note">Track issue summary, status split, and recent reporting trend.</p>
+
+        <div class="chart-grid">
+            <article class="chart-card">
+                <h4>Issue Distribution</h4>
+                <div class="chart-wrap chart-wrap-sm">
+                    <canvas id="issueSummaryChart"></canvas>
+                </div>
+            </article>
+
+            <article class="chart-card">
+                <h4>Status Breakdown</h4>
+                <div class="chart-wrap chart-wrap-sm">
+                    <canvas id="issueStatusChart"></canvas>
+                </div>
+            </article>
+        </div>
+
+        <article class="chart-card chart-card-wide">
+            <h4>Recent Issue Trend</h4>
+            <div class="chart-wrap">
+                <canvas id="issueTrendChart"></canvas>
+            </div>
+        </article>
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="{{ url_for('static', filename='js/admin_dashboard.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>My Issues</h2>
+
+    <div class="pill-bar">
+        <a class="pill {% if not status_filter %}active{% endif %}" href="{{ url_for('customer_issues', priority=priority_filter) }}">All Statuses</a>
+        <a class="pill {% if status_filter == 'Open' %}active{% endif %}" href="{{ url_for('customer_issues', status='Open', priority=priority_filter) }}">Open</a>
+        <a class="pill {% if status_filter == 'In Progress' %}active{% endif %}" href="{{ url_for('customer_issues', status='In Progress', priority=priority_filter) }}">In Progress</a>
+        <a class="pill {% if status_filter == 'Resolved' %}active{% endif %}" href="{{ url_for('customer_issues', status='Resolved', priority=priority_filter) }}">Resolved</a>
+    </div>
+
+    <form method="get" class="filter-bar">
+        <select name="status">
+            <option value="">Filter by status</option>
+            <option value="Open" {% if status_filter == 'Open' %}selected{% endif %}>Open</option>
+            <option value="In Progress" {% if status_filter == 'In Progress' %}selected{% endif %}>In Progress</option>
+            <option value="Resolved" {% if status_filter == 'Resolved' %}selected{% endif %}>Resolved</option>
+        </select>
+
+        <select name="priority">
+            <option value="">Filter by priority</option>
+            <option value="Low" {% if priority_filter == 'Low' %}selected{% endif %}>Low</option>
+            <option value="Medium" {% if priority_filter == 'Medium' %}selected{% endif %}>Medium</option>
+            <option value="High" {% if priority_filter == 'High' %}selected{% endif %}>High</option>
+            <option value="Critical" {% if priority_filter == 'Critical' %}selected{% endif %}>Critical</option>
+        </select>
+
+        <button type="submit" class="btn btn-small">Apply</button>
+        <a href="{{ url_for('customer_issues') }}" class="btn btn-outline btn-small">Reset</a>
+        <button type="button" class="btn btn-outline btn-small table-compact-toggle" data-target="customer-issues-table">Compact Mode</button>
+    </form>
+
+    <div class="table-wrap">
+        <table id="customer-issues-table">
+            <thead>
+                <tr>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'title' %}active{% endif %}" href="{{ url_for('customer_issues', status=status_filter, priority=priority_filter, sort_by='title', sort_dir='asc' if sort_by != 'title' or sort_dir == 'desc' else 'desc') }}">
+                            Title {% if sort_by == 'title' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Category</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'priority' %}active{% endif %}" href="{{ url_for('customer_issues', status=status_filter, priority=priority_filter, sort_by='priority', sort_dir='asc' if sort_by != 'priority' or sort_dir == 'desc' else 'desc') }}">
+                            Priority {% if sort_by == 'priority' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'status' %}active{% endif %}" href="{{ url_for('customer_issues', status=status_filter, priority=priority_filter, sort_by='status', sort_dir='asc' if sort_by != 'status' or sort_dir == 'desc' else 'desc') }}">
+                            Status {% if sort_by == 'status' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Remark</th>
+                    <th>Attachments</th>
+                    <th>
+                        <a class="sort-link {% if sort_by == 'created_at' %}active{% endif %}" href="{{ url_for('customer_issues', status=status_filter, priority=priority_filter, sort_by='created_at', sort_dir='asc' if sort_by != 'created_at' or sort_dir == 'desc' else 'desc') }}">
+                            Submitted At {% if sort_by == 'created_at' %}{{ '↑' if sort_dir == 'asc' else '↓' }}{% endif %}
+                        </a>
+                    </th>
+                    <th>Action</th>
+                    <th>Rating</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for issue in issues %}
+                <tr>
+                    <td>{{ issue.title }}</td>
+                    <td>{{ issue.category }}</td>
+                    <td><span class="badge priority-{{ issue.priority|lower|replace(' ', '-') }}">{{ issue.priority }}</span></td>
+                    <td><span class="badge status-{{ issue.status|lower|replace(' ', '-') }}">{{ issue.status }}</span></td>
+                    <td>{{ issue.remark if issue.remark else "-" }}</td>
+                    <td>
+                        {% if issue.attachments %}
+                            <div class="attachment-list">
+                                {% for file_name in issue.attachments %}
+                                    <a href="{{ url_for('uploaded_file', filename=file_name) }}" target="_blank">View {{ loop.index }}</a>
+                                {% endfor %}
+                            </div>
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                    <td>{{ issue.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>
+                        <div class="inline-form">
+                            {% if issue.status == "Resolved" %}
+                            <form method="post" action="{{ url_for('reopen_issue', issue_id=issue.id) }}" class="inline-form">
+                                <textarea name="reopen_reason" rows="2" placeholder="Reason to reopen" required></textarea>
+                                <button type="submit" class="btn btn-small">Reopen</button>
+                            </form>
+                            {% endif %}
+                            <form method="post" action="{{ url_for('delete_customer_issue', issue_id=issue.id) }}" onsubmit="return confirm('Delete this issue permanently?');">
+                                <button type="submit" class="icon-btn icon-btn-danger" aria-label="Delete issue" title="Delete issue">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                                        <path d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v8h-2V9zm4 0h2v8h-2V9zM7 9h2v8H7V9zm1 12c-1.1 0-2-.9-2-2V8h12v11c0 1.1-.9 2-2 2H8z"></path>
+                                    </svg>
+                                </button>
+                            </form>
+                        </div>
+                    </td>
+                    <td>
+                        {% if issue.status == "Resolved" %}
+                            {% if issue.rating_data %}
+                                <strong>{{ issue.rating_data.rating }}/5</strong><br>
+                                <small>{{ issue.rating_data.feedback if issue.rating_data.feedback else "No feedback" }}</small>
+                            {% else %}
+                                <form method="post" action="{{ url_for('rate_issue', issue_id=issue.id) }}" class="inline-form">
+                                    <select name="rating" required>
+                                        <option value="">Rate 1-5</option>
+                                        <option value="5">5 - Excellent</option>
+                                        <option value="4">4 - Good</option>
+                                        <option value="3">3 - Average</option>
+                                        <option value="2">2 - Poor</option>
+                                        <option value="1">1 - Very Poor</option>
+                                    </select>
+                                    <textarea name="feedback" rows="2" placeholder="Feedback (optional)"></textarea>
+                                    <button type="submit" class="btn btn-small">Submit</button>
+                                </form>
+                            {% endif %}
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="9">No issues found.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

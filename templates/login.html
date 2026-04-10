@@ -1,0 +1,32 @@
+
+{% extends "base.html" %}
+{% block content %}
+<section class="auth-shell">
+    <aside class="auth-visual photo-customer">
+        <div class="auth-visual-content">
+            <h2>Track Every Customer Issue</h2>
+            <p>Sign in to submit issues, attach documents, and monitor status in one place.</p>
+            <div class="auth-chip-row">
+                <span class="auth-chip">Fast Tickets</span>
+                <span class="auth-chip">Live Status</span>
+                <span class="auth-chip">Secure Access</span>
+            </div>
+        </div>
+    </aside>
+    <div class="card auth-card">
+        <h2>Customer Login</h2>
+        <form method="post" class="form-grid">
+            <label>Email
+                <input type="email" name="email" required>
+            </label>
+            <label>Password
+                <input type="password" name="password" required>
+            </label>
+            <button type="submit" class="btn">Login</button>
+            <a class="btn btn-outline" href="{{ url_for('forgot_password') }}">Forgot Password?</a>
+        </form>
+        <p class="muted-note auth-footnote auth-divider">New user? <a href="{{ url_for('register') }}">Create account</a></p>
+    </div>
+</section>
+{% endblock %}
+

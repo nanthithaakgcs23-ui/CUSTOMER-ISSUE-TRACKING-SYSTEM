@@ -1,0 +1,63 @@
+
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div class="hero-grid">
+        <div class="hero-content">
+            <h1>Customer Issue Tracking System</h1>
+            <p>Track customer issues from submission to resolution with a clear workflow.</p>
+            <div class="hero-actions">
+                <a class="btn" href="{{ url_for('customer_login') }}">Customer Login</a>
+                <a class="btn btn-outline" href="{{ url_for('admin_login') }}">Admin Login</a>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="landing-stats">
+    <article class="landing-stat">
+        <h3>Faster Support Flow</h3>
+        <p>Track and resolve issues with a structured process from submission to closure.</p>
+    </article>
+    <article class="landing-stat">
+        <h3>Role-Based Access</h3>
+        <p>Customers and admins get focused views, actions, and dashboards for their tasks.</p>
+    </article>
+    <article class="landing-stat">
+        <h3>Smart Reporting</h3>
+        <p>Export issue data and monitor trends by priority, status, and category.</p>
+    </article>
+</section>
+
+<section class="feature-section">
+    <h2>Core Features</h2>
+    <div class="feature-grid">
+        <article class="feature-card">
+            <h3>Customer Self Service</h3>
+            <p>Raise issues, attach files, track status, and reopen resolved items with reason.</p>
+        </article>
+        <article class="feature-card">
+            <h3>Admin Issue Control</h3>
+            <p>Filter by priority/status, update progress, add remarks, and export CSV reports.</p>
+        </article>
+        <article class="feature-card">
+            <h3>Secure Access</h3>
+            <p>Session authentication, password hashing, and reset flow with signed tokens.</p>
+        </article>
+        <article class="feature-card">
+            <h3>Responsive Interface</h3>
+            <p>Clean layout, theme switcher, mobile support, and interactive dashboards.</p>
+        </article>
+    </div>
+</section>
+
+<section class="landing-cta card">
+    <h2>Start Managing Customer Issues Better</h2>
+    <p class="muted-note">Create an account, submit your first issue, and track it in real time.</p>
+    <div class="hero-actions">
+        <a class="btn" href="{{ url_for('register') }}">Create Customer Account</a>
+        <a class="btn btn-outline" href="{{ url_for('customer_login') }}">Go to Login</a>
+    </div>
+</section>
+{% endblock %}
+

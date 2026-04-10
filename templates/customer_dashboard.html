@@ -1,0 +1,87 @@
+
+{% extends "base.html" %}
+{% block content %}
+<section class="dashboard-hero-grid">
+    <article class="card dashboard-intro">
+        <h2>Customer Dashboard</h2>
+        <p class="muted-note">Track every ticket clearly with status, priority, and timeline updates.</p>
+        <div class="hero-actions">
+            <a href="{{ url_for('create_issue') }}" class="btn">Create New Issue</a>
+            <a href="{{ url_for('customer_issues') }}" class="btn btn-outline">View All Issues</a>
+        </div>
+    </article>
+    <article class="card dashboard-image-card">
+        <img src="{{ url_for('static', filename='images/support-illustration.svg') }}" alt="Support dashboard illustration">
+    </article>
+</section>
+
+<section class="dashboard-head">
+    <h3>Overview</h3>
+</section>
+
+<section class="stats-grid">
+    <article class="card stat-card">
+        <img class="stat-icon" src="{{ url_for('static', filename='images/issues-icon.svg') }}" alt="Total issues">
+        <h3>Total Issues</h3>
+        <p>{{ total_issues }}</p>
+    </article>
+    <article class="card stat-card">
+        <img class="stat-icon" src="{{ url_for('static', filename='images/active-icon.svg') }}" alt="Active issues">
+        <h3>Active Issues</h3>
+        <p>{{ active_issues }}</p>
+    </article>
+</section>
+
+<section
+    class="card notifications-card"
+    data-notifications-panel
+    data-notification-feed-url="{{ url_for('notification_feed') }}"
+    data-notification-mark-read-url="{{ url_for('mark_notification_feed_read') }}"
+>
+    <div class="dashboard-head notifications-head">
+        <div>
+            <h3>Notifications</h3>
+            <p class="muted-note">See when the admin resolves one of your issues.</p>
+        </div>
+    </div>
+    <div class="notification-list" data-notification-list>
+        {% for notification in notifications %}
+        <a href="{{ notification.link }}" class="notification-item {% if not notification.is_read %}notification-unread{% endif %}">
+            <div>
+                <strong>{{ notification.message }}</strong>
+                <p>{{ notification.created_at }}</p>
+            </div>
+            <span class="notification-link">View</span>
+        </a>
+        {% else %}
+        <p class="notification-empty" data-notification-empty>No notifications yet.</p>
+        {% endfor %}
+    </div>
+</section>
+
+<section class="card">
+    <h3>Recent Issues</h3>
+    <div class="issues-grid">
+        {% for issue in recent_issues %}
+        <article class="issue-item" tabindex="0" role="button" aria-expanded="false">
+            <div class="issue-item-head">
+                <h4>{{ issue.title }}</h4>
+                <span class="badge priority-{{ issue.priority|lower|replace(' ', '-') }}">{{ issue.priority }}</span>
+            </div>
+            <div class="issue-item-meta">
+                <span>Category: <strong>{{ issue.category }}</strong></span>
+                <span>Status: <span class="badge status-{{ issue.status|lower|replace(' ', '-') }}">{{ issue.status }}</span></span>
+            </div>
+            <p class="issue-item-date">Submitted: {{ issue.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+            <p class="issue-item-hint">Tap to view full details</p>
+            <div class="issue-item-details">
+                <p><strong>Description:</strong> {{ issue.description }}</p>
+                <p><strong>Admin Remark:</strong> {{ issue.remark if issue.remark else "No remark yet." }}</p>
+            </div>
+        </article>
+        {% else %}
+        <p>No issues submitted yet.</p>
+        {% endfor %}
+    </div>
+</section>
+{% endblock %}

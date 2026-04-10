@@ -1,0 +1,47 @@
+
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    <h2>Submit New Issue</h2>
+    <form method="post" enctype="multipart/form-data" id="issue-form" class="form-grid">
+        <label>Issue Title
+            <input type="text" name="title" id="title" maxlength="200" required>
+        </label>
+        <div id="duplicate-warning" class="duplicate-warning" hidden></div>
+
+        <label>Category
+            <select name="category" required>
+                <option value="">Select category</option>
+                <option>Technical</option>
+                <option>Billing</option>
+                <option>Account</option>
+                <option>Service</option>
+                <option>Other</option>
+            </select>
+        </label>
+
+        <label>Priority
+            <select name="priority" required>
+                <option value="">Select priority</option>
+                <option>Low</option>
+                <option>Medium</option>
+                <option>High</option>
+                <option>Critical</option>
+            </select>
+        </label>
+
+        <label>Description
+            <textarea name="description" id="description" rows="6" required></textarea>
+        </label>
+
+        <label>Optional Attachments (up to 5 files, max 5 MB each)
+            <input type="file" name="attachments" id="attachments" multiple accept=".png,.jpg,.jpeg,.pdf,.doc,.docx,.txt">
+        </label>
+        <small class="muted-note">Allowed: PNG, JPG, PDF, DOC, DOCX, TXT</small>
+        <div id="attachment-preview" class="attachment-preview"></div>
+
+        <button type="submit" class="btn">Submit Issue</button>
+    </form>
+</div>
+{% endblock %}
+
